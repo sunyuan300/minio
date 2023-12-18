@@ -243,10 +243,13 @@ func serverHandleCmdArgs(ctx *cli.Context) {
 	// Register root CAs for remote ENVs
 	env.RegisterGlobalCAs(globalRootCAs)
 
+	// 设置EndpointServerPools和setupType,里面流程很多,包括单机部署(单磁盘/多磁盘)、分布式部署等处理逻辑...
 	globalEndpoints, setupType, err = createServerEndpoints(globalMinioAddr, serverCmdArgs(ctx)...)
 	logger.FatalIf(err, "Invalid command line arguments")
 
+	// 获取本机节点名称
 	globalLocalNodeName = GetLocalPeer(globalEndpoints, globalMinioHost, globalMinioPort)
+	// TODO:计算空字符串的校验和? 这里没看懂...
 	nodeNameSum := sha256.Sum256([]byte(globalLocalNodeNameHex))
 	globalLocalNodeNameHex = hex.EncodeToString(nodeNameSum[:])
 
@@ -254,6 +257,7 @@ func serverHandleCmdArgs(ctx *cli.Context) {
 	for _, z := range globalEndpoints {
 		for _, ep := range z.Endpoints {
 			if ep.IsLocal {
+				// TODO:如果本机有多个endpoint,不是以最后一个为准？
 				globalRemoteEndpoints[globalLocalNodeName] = ep
 			} else {
 				globalRemoteEndpoints[ep.Host] = ep
@@ -505,37 +509,41 @@ func getServerListenAddrs() []string {
 
 // serverMain handler called for 'minio server' command.
 func serverMain(ctx *cli.Context) {
+	// 注册信号
 	signal.Notify(globalOSSignalCh, os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT)
 
+	// 信号处理逻辑,包括HTTP、Service、OS相关的信号
 	go handleSignals()
 
+	// 设置go runtime的默认配置
 	setDefaultProfilerRates()
 
-	// Initialize globalConsoleSys system
+	// 初始化console logger target作为发布订阅系统,用于将logs发布给订阅系统,
+	// 订阅系统包括console、http、kafka;同时将其添加到systemTargets.
 	globalConsoleSys = NewConsoleLogger(GlobalContext)
 	logger.AddSystemTarget(globalConsoleSys)
 
-	// Perform any self-tests
+	// 执行一些自测功能
 	bitrotSelfTest()
 	erasureSelfTest()
 	compressSelfTest()
 
-	// Handle all server environment vars.
+	// 处理环境变量
 	serverHandleEnvVars()
 
-	// Handle all server command args.
+	// 处理flag和args
 	serverHandleCmdArgs(ctx)
 
 	// Initialize KMS configuration
 	handleKMSConfig()
 
-	// Set node name, only set for distributed setup.
+	// 设置节点名称(仅分布式部署才设置)
 	globalConsoleSys.SetNodeName(globalLocalNodeName)
 
-	// Initialize all help
+	// 初始化帮助信息
 	initHelp()
 
-	// Initialize all sub-systems
+	// 初始化所有子系统,包括桶、IAM、策略等众多子系统。所有子系统的初始化都是创建一个相应的结构体,只有极少数还会启动相应的goroutine。
 	initAllSubsystems(GlobalContext)
 
 	// Is distributed setup, error out if no certificates are found for HTTPS endpoints.
@@ -548,7 +556,7 @@ func serverMain(ctx *cli.Context) {
 		}
 	}
 
-	// Check for updates in non-blocking manner.
+	// 检查二进制是否需要更新
 	go func() {
 		if !globalCLIContext.Quiet && !globalInplaceUpdateDisabled {
 			// Check for new updates from dl.min.io.
@@ -556,21 +564,22 @@ func serverMain(ctx *cli.Context) {
 		}
 	}()
 
-	// Set system resources to maximum.
+	// 设置最大线程、文件描述符、内存等资源。
 	setMaxResources()
 
-	// Verify kernel release and version.
+	// 检查内核版本
 	if oldLinux() {
 		logger.Info(color.RedBold("WARNING: Detected Linux kernel version older than 4.0.0 release, there are some known potential performance problems with this kernel version. MinIO recommends a minimum of 4.x.x linux kernel version for best performance"))
 	}
 
+	// 检查go runtime P的数量设置
 	maxProcs := runtime.GOMAXPROCS(0)
 	cpuProcs := runtime.NumCPU()
 	if maxProcs < cpuProcs {
 		logger.Info(color.RedBoldf("WARNING: Detected GOMAXPROCS(%d) < NumCPU(%d), please make sure to provide all PROCS to MinIO for optimal performance", maxProcs, cpuProcs))
 	}
 
-	// Configure server.
+	// 创建并初始化httpServer的handler(即向router注册相关的路由信息)
 	handler, err := configureServerHandler(globalEndpoints)
 	if err != nil {
 		logger.Fatal(config.ErrUnexpectedError(err), "Unable to configure one of server's RPC services")
@@ -581,6 +590,7 @@ func serverMain(ctx *cli.Context) {
 		getCert = globalTLSCerts.GetCertificate
 	}
 
+	// 创建并初始化httpServer实例
 	httpServer := xhttp.NewServer(getServerListenAddrs()).
 		UseHandler(setCriticalErrorHandler(corsHandler(handler))).
 		UseTLSConfig(newTLSConfig(getCert)).
@@ -591,10 +601,12 @@ func serverMain(ctx *cli.Context) {
 		UseCustomLogger(log.New(io.Discard, "", 0)). // Turn-off random logging by Go stdlib
 		UseTCPOptions(globalTCPOptions)
 
+	// 启动http服务
 	go func() {
 		globalHTTPServerErrorCh <- httpServer.Start(GlobalContext)
 	}()
 
+	// 使用全局变量globalHTTPServer记录httpServer实例
 	setHTTPServer(httpServer)
 
 	if globalIsDistErasure {
@@ -605,6 +617,8 @@ func serverMain(ctx *cli.Context) {
 		}
 	}
 
+	// 初始化磁盘相关meta并启动相关的goroutine,内部流程很复杂...
+	// newObject相当于是对象存储的存储引擎,对上层提供对应API实现相应的功能。
 	newObject, err := newObjectLayer(GlobalContext, globalEndpoints)
 	if err != nil {
 		logFatalErrs(err, Endpoint{}, true)
@@ -615,7 +629,7 @@ func serverMain(ctx *cli.Context) {
 
 	globalLeaderLock = newSharedLock(GlobalContext, newObject, "leader.lock")
 
-	// Enable background operations for erasure coding
+	// 启用EC后台操作gorotine
 	initAutoHeal(GlobalContext, newObject)
 	initHealMRF(GlobalContext, newObject)
 	initBackgroundExpiry(GlobalContext, newObject)
@@ -647,7 +661,7 @@ func serverMain(ctx *cli.Context) {
 		logger.LogIf(GlobalContext, err)
 	}
 
-	// Initialize users credentials and policies in background right after config has initialized.
+	// 配置初始化后立即在后台初始化用户凭据和策略
 	go func() {
 		globalIAMSys.Init(GlobalContext, newObject, globalEtcdClient, globalRefreshIAMInterval)
 
@@ -679,7 +693,7 @@ func serverMain(ctx *cli.Context) {
 		}
 	}()
 
-	// Background all other operations such as initializing bucket metadata etc.
+	// 后台所有其他操作，例如初始化存储桶元数据等。
 	go func() {
 		// Initialize data scanner.
 		initDataScanner(GlobalContext, newObject)

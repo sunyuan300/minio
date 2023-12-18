@@ -398,13 +398,13 @@ func handleCommonCmdArgs(ctx *cli.Context) {
 		logger.EnableAnonymous()
 	}
 
-	// Fetch address option
+	// 解析minio监听地址
 	addr := ctx.GlobalString("address")
 	if addr == "" || addr == ":"+GlobalMinioDefaultPort {
 		addr = ctx.String("address")
 	}
 
-	// Fetch console address option
+	// 解析console的监听地址
 	consoleAddr := ctx.GlobalString("console-address")
 	if consoleAddr == "" {
 		consoleAddr = ctx.String("console-address")
@@ -441,7 +441,7 @@ func handleCommonCmdArgs(ctx *cli.Context) {
 		globalCLIContext.StrictS3Compat = false
 	}
 
-	// Set all config, certs and CAs directories.
+	// 创建conf、certs、CAs目录
 	var configSet, certsSet bool
 	globalConfigDir, configSet = newConfigDirFromCtx(ctx, "config-dir", defaultConfigDir.Get)
 	globalCertsDir, certsSet = newConfigDirFromCtx(ctx, "certs-dir", defaultCertsDir.Get)
@@ -551,6 +551,7 @@ func readFromSecret(sp string) (string, error) {
 	return string(bytes.TrimSpace(credBuf)), nil
 }
 
+// 从环境变量中获取认证信息的文件路径,读取认证信息并将其设置到新的环境变量中
 func loadEnvVarsFromFiles() {
 	if env.IsSet(config.EnvAccessKeyFile) {
 		accessKey, err := readFromSecret(env.Get(config.EnvAccessKeyFile, ""))
@@ -620,6 +621,7 @@ func loadEnvVarsFromFiles() {
 func handleCommonEnvVars() {
 	loadEnvVarsFromFiles()
 
+	// 是否开启浏览器访问
 	var err error
 	globalBrowserEnabled, err = config.ParseBool(env.Get(config.EnvBrowser, config.EnableOn))
 	if err != nil {
@@ -642,6 +644,7 @@ func handleCommonEnvVars() {
 		}
 	}
 
+	// MinioEndpoint 地址解析
 	if serverURL := env.Get(config.EnvMinIOServerURL, ""); serverURL != "" {
 		u, err := xnet.ParseHTTPURL(serverURL)
 		if err != nil {
@@ -659,11 +662,13 @@ func handleCommonEnvVars() {
 		globalMinioEndpointURL = u
 	}
 
+	// 是否开启FS_OSync
 	globalFSOSync, err = config.ParseBool(env.Get(config.EnvFSOSync, config.EnableOff))
 	if err != nil {
 		logger.Fatal(config.ErrInvalidFSOSyncValue(err), "Invalid MINIO_FS_OSYNC value in environment variable")
 	}
 
+	// 磁盘阈值大小解析
 	if rootDiskSize := env.Get(config.EnvRootDiskThresholdSize, ""); rootDiskSize != "" {
 		size, err := humanize.ParseBytes(rootDiskSize)
 		if err != nil {
@@ -672,6 +677,7 @@ func handleCommonEnvVars() {
 		globalRootDiskThreshold = size
 	}
 
+	// globalDomainNames 域名解析
 	domains := env.Get(config.EnvDomain, "")
 	if len(domains) != 0 {
 		for _, domainName := range strings.Split(domains, config.ValueSeparator) {
@@ -691,6 +697,7 @@ func handleCommonEnvVars() {
 		}
 	}
 
+	// ip地址解析
 	publicIPs := env.Get(config.EnvPublicIPs, "")
 	if len(publicIPs) != 0 {
 		minioEndpoints := strings.Split(publicIPs, config.ValueSeparator)
