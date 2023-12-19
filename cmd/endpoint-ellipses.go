@@ -349,7 +349,7 @@ func createServerEndpoints(serverAddr string, args ...string) (
 		ok = ok && !ellipses.HasEllipses(arg)
 	}
 
-	// None of the args have ellipses use the old style.
+	// 没有一个带有省略号的参数使用旧样式。
 	if ok {
 		setArgs, err := GetAllSets(args...)
 		if err != nil {
@@ -371,7 +371,9 @@ func createServerEndpoints(serverAddr string, args ...string) (
 		return endpointServerPools, setupType, nil
 	}
 
+	// TODO:foundPrevLocal变量在后续的调用中,并未被使用,冗余变量。
 	var foundPrevLocal bool
+	// 为不同的服务池生成serverPool实例,并追加到endpointServerPools中。
 	for _, arg := range args {
 		if !ellipses.HasEllipses(arg) && len(args) > 1 {
 			// TODO: support SNSD deployments to be decommissioned in future

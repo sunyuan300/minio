@@ -81,7 +81,7 @@ func newErasureServerPools(ctx context.Context, endpointServerPools EndpointServ
 		}
 	)
 
-	cd // 初始化每个serverPool的parityShard并格式化磁盘
+	// 初始化每个serverPool的parityShard并格式化磁盘
 	var localDrives []StorageAPI
 	local := endpointServerPools.FirstLocal()
 	for i, ep := range endpointServerPools {
@@ -114,7 +114,7 @@ func newErasureServerPools(ctx context.Context, endpointServerPools EndpointServ
 		}
 
 		if deploymentID == "" {
-			// all pools should have same deployment ID
+			// 所有的serverPool应该具有相同的部署ID
 			deploymentID = formats[i].ID
 		}
 

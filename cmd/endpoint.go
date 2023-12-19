@@ -19,6 +19,7 @@ package cmd
 
 import (
 	"fmt"
+	"github.com/dustin/go-humanize"
 	"net"
 	"net/http"
 	"net/url"
@@ -31,7 +32,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/dustin/go-humanize"
 	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio/internal/config"
 	"github.com/minio/minio/internal/logger"
@@ -86,7 +86,7 @@ func (endpoint Endpoint) HTTPS() bool {
 	return endpoint.Scheme == "https"
 }
 
-// UpdateIsLocal - resolves the host and updates if it is local or not.
+// UpdateIsLocal - 解析host并更新它是否是本地的。
 func (endpoint *Endpoint) UpdateIsLocal() (err error) {
 	if !endpoint.IsLocal {
 		endpoint.IsLocal, err = isLocalHost(endpoint.Hostname(), endpoint.Port(), globalMinioPort)
@@ -97,7 +97,7 @@ func (endpoint *Endpoint) UpdateIsLocal() (err error) {
 	return nil
 }
 
-// NewEndpoint - returns new endpoint based on given arguments.
+// NewEndpoint - 检查arg表示的地址是否合法并创建Endpoint。
 func NewEndpoint(arg string) (ep Endpoint, e error) {
 	// isEmptyPath - check whether given path is not empty.
 	isEmptyPath := func(path string) bool {
@@ -439,7 +439,7 @@ func hostResolveToLocalhost(endpoint Endpoint) bool {
 	return loopback == len(hostIPs)
 }
 
-// UpdateIsLocal - resolves the host and discovers the local host.
+// UpdateIsLocal - 遍历所有节点的地址,判断是否为本地地址并更新IsLocal。
 func (endpoints Endpoints) UpdateIsLocal(foundPrevLocal bool) error {
 	orchestrated := IsDocker() || IsKubernetes()
 
@@ -451,33 +451,30 @@ func (endpoints Endpoints) UpdateIsLocal(foundPrevLocal bool) error {
 	keepAliveTicker := time.NewTicker(10 * time.Millisecond)
 	defer keepAliveTicker.Stop()
 	for {
-		// Break if the local endpoint is found already Or all the endpoints are resolved.
+		// 如果已经找到本地地址或所有节点已被解析,退出for循环。
 		if foundLocal || (epsResolved == len(endpoints)) {
 			break
 		}
-		// Retry infinitely on Kubernetes and Docker swarm.
-		// This is needed as the remote hosts are sometime
-		// not available immediately.
+		// 在k8s和Docker swarm上无限重试。这是需要的，因为远程主机有时无法立即可用。
 		select {
 		case <-globalOSSignalCh:
 			return fmt.Errorf("The endpoint resolution got interrupted")
 		default:
 			for i, resolved := range resolvedList {
 				if resolved {
-					// Continue if host is already resolved.
+					// 节点已经被解析,continue
 					continue
 				}
 
-				// Log the message to console about the host resolving
+				// 将主机解析的消息记录到控制台
 				reqInfo := (&logger.ReqInfo{}).AppendTags(
 					"host",
 					endpoints[i].Hostname(),
 				)
 
 				if orchestrated && hostResolveToLocalhost(endpoints[i]) {
-					// time elapsed
 					timeElapsed := time.Since(startTime)
-					// log error only if more than a second has elapsed
+					// 仅当时间超过一秒时才记录错误
 					if timeElapsed > time.Second {
 						reqInfo.AppendTags("elapsedTime",
 							humanize.RelTime(startTime,
@@ -494,9 +491,7 @@ func (endpoints Endpoints) UpdateIsLocal(foundPrevLocal bool) error {
 					continue
 				}
 
-				// return err if not Docker or Kubernetes
-				// We use IsDocker() to check for Docker environment
-				// We use IsKubernetes() to check for Kubernetes environment
+				// 判断是否是本地地址
 				isLocal, err := isLocalHost(endpoints[i].Hostname(),
 					endpoints[i].Port(),
 					globalMinioPort,
@@ -505,9 +500,7 @@ func (endpoints Endpoints) UpdateIsLocal(foundPrevLocal bool) error {
 					return err
 				}
 				if err != nil {
-					// time elapsed
 					timeElapsed := time.Since(startTime)
-					// log error only if more than a second has elapsed
 					if timeElapsed > time.Second {
 						reqInfo.AppendTags("elapsedTime",
 							humanize.RelTime(startTime,
@@ -565,14 +558,13 @@ func NewEndpoints(args ...string) (endpoints Endpoints, err error) {
 	var scheme string
 
 	uniqueArgs := set.NewStringSet()
-	// Loop through args and adds to endpoint list.
 	for i, arg := range args {
 		endpoint, err := NewEndpoint(arg)
 		if err != nil {
 			return nil, fmt.Errorf("'%s': %s", arg, err.Error())
 		}
 
-		// All endpoints have to be same type and scheme if applicable.
+		// 所有节点的endpointType和scheme必须相等
 		//nolint:gocritic
 		if i == 0 {
 			endpointType = endpoint.Type()
@@ -610,20 +602,20 @@ func checkCrossDeviceMounts(endpoints Endpoints) (err error) {
 	return mountinfo.CheckCrossDevice(absPaths)
 }
 
-// CreateEndpoints - validates and creates new endpoints for given args.
+// CreateEndpoints - 验证节点地址的合法性并创建Endpoints
 func CreateEndpoints(serverAddr string, foundLocal bool, args ...[]string) (Endpoints, SetupType, error) {
 	var endpoints Endpoints
 	var setupType SetupType
 	var err error
 
-	// Check whether serverAddr is valid for this host.
+	// 检查当前节点指定的地址是否合法且是local地址
 	if err = CheckLocalServerAddr(serverAddr); err != nil {
 		return endpoints, setupType, err
 	}
 
 	_, serverAddrPort := mustSplitHostPort(serverAddr)
 
-	// For single arg, return FS setup.
+	// 单卷单条带使用FS设置
 	if len(args) == 1 && len(args[0]) == 1 {
 		var endpoint Endpoint
 		endpoint, err = NewEndpoint(args[0][0])
@@ -647,8 +639,8 @@ func CreateEndpoints(serverAddr string, foundLocal bool, args ...[]string) (Endp
 		return endpoints, setupType, nil
 	}
 
+	// 将所有节点的地址转换为Endpoint对象并检查是否存在跨设备挂载
 	for _, iargs := range args {
-		// Convert args to endpoints
 		eps, err := NewEndpoints(iargs...)
 		if err != nil {
 			return endpoints, setupType, config.ErrInvalidErasureEndpoints(nil).Msg(err.Error())
@@ -672,15 +664,16 @@ func CreateEndpoints(serverAddr string, foundLocal bool, args ...[]string) (Endp
 		return endpoints, setupType, nil
 	}
 
+	// 遍历所有节点的地址,并判断是否为本地地址
 	if err = endpoints.UpdateIsLocal(foundLocal); err != nil {
 		return endpoints, setupType, config.ErrInvalidErasureEndpoints(nil).Msg(err.Error())
 	}
 
-	// Here all endpoints are URL style.
+	// 这里所有的端点都是URL样式。
 	endpointPathSet := set.NewStringSet()
-	localEndpointCount := 0
 	localServerHostSet := set.NewStringSet()
 	localPortSet := set.NewStringSet()
+	localEndpointCount := 0
 
 	for _, endpoint := range endpoints {
 		endpointPathSet.Add(endpoint.Path)
@@ -699,10 +692,10 @@ func CreateEndpoints(serverAddr string, foundLocal bool, args ...[]string) (Endp
 	}
 
 	orchestrated := IsKubernetes() || IsDocker()
+	// 在物理机部署的前提下,检查是否存在使用相同地址但不同的端口提供服务，且使用相同的path(即相同目录存储数据)的情况。
+	// http://ip:port1/path
+	// http://ip:port2/path
 	if !orchestrated {
-		// Check whether same path is not used in endpoints of a host on different port.
-		// Only verify this on baremetal setups, DNS is not available in orchestrated
-		// environments so we can't do much here.
 		{
 			pathIPMap := make(map[string]set.StringSet)
 			hostIPCache := make(map[string]set.StringSet)
@@ -729,7 +722,9 @@ func CreateEndpoints(serverAddr string, foundLocal bool, args ...[]string) (Endp
 		}
 	}
 
-	// Check whether same path is used for more than 1 local endpoints.
+	// 检查本地节点是否存在使用不同的地址提供服务,但使用一样的path。
+	// http://ip1:port/path
+	// http://ip2:port/path
 	{
 		localPathSet := set.CreateStringSet()
 		for _, endpoint := range endpoints {
@@ -744,7 +739,7 @@ func CreateEndpoints(serverAddr string, foundLocal bool, args ...[]string) (Endp
 		}
 	}
 
-	// Add missing port in all endpoints.
+	// 如果节点地址中未指定端口,则将本节点监听的端口值作为其他节点的端口。
 	for i := range endpoints {
 		_, port, err := net.SplitHostPort(endpoints[i].Host)
 		if err != nil {
@@ -755,10 +750,9 @@ func CreateEndpoints(serverAddr string, foundLocal bool, args ...[]string) (Endp
 		}
 	}
 
-	// All endpoints are pointing to local host
+	// 所有节点都指向本机
 	if len(endpoints) == localEndpointCount {
-		// If all endpoints have same port number, Just treat it as local erasure setup
-		// using URL style endpoints.
+		// 如果所有节点的端口号相同,直接视为ErasureSetupType类型,而不是DistErasureSetupType类型。
 		if len(localPortSet) == 1 {
 			if len(localServerHostSet) > 1 {
 				return endpoints, setupType,
@@ -776,7 +770,7 @@ func CreateEndpoints(serverAddr string, foundLocal bool, args ...[]string) (Endp
 		uniqueArgs.Add(endpoint.Host)
 	}
 
-	// Error out if we have less than 2 unique servers.
+	// 至少需要两个不同的节点,才能视为DistErasureSetupType类型
 	if len(uniqueArgs.ToSlice()) < 2 && setupType == DistErasureSetupType {
 		err := fmt.Errorf("Unsupported number of endpoints (%s), minimum number of servers cannot be less than 2 in distributed setup", endpoints)
 		return endpoints, setupType, err
