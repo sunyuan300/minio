@@ -531,7 +531,17 @@ func serverMain(ctx *cli.Context) {
 	// 处理环境变量
 	serverHandleEnvVars()
 
-	// 处理flag和args
+	/* 处理flag和args,内部流程涉及到serverPool的构造,流程多且复杂。
+	/
+	/ eg: http://node{1...16}.example.com/mnt/export{1...32} http://node{17...64}.example.com/mnt/export{1...64}
+	/ 会构造两个serverPool,每个pool都有其对应的SetCount(类似于可以划分为多少个volume)和DrivesPerSet(每个volume的条带宽度),
+	/ 支持的条带宽度是[2,16],用总磁盘数除以条带宽度就是volume的数量;条带内有多少是DataShard/PartiShard由storage Class决定。
+	/
+	/ 比如serverPool1:
+	/ 总磁盘数 = 节点数* 每节点磁盘数 = 16*32
+	/ 条带宽度 = 16
+	/ volume = 16*32/16 = 32
+	*/
 	serverHandleCmdArgs(ctx)
 
 	// Initialize KMS configuration
