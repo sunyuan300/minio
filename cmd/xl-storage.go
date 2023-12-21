@@ -262,8 +262,7 @@ func newXLStorage(ep Endpoint, cleanUp bool) (s *xlStorage, err error) {
 	s.formatData = formatData
 	s.formatFileInfo = formatFi
 
-	// Return an error if ODirect is not supported
-	// unless it is a single erasure disk mode
+	// 检查磁盘是否支持Direct写
 	if err := s.checkODirectDiskSupport(); err == nil {
 		s.oDirect = true
 	} else {
@@ -275,6 +274,7 @@ func newXLStorage(ep Endpoint, cleanUp bool) (s *xlStorage, err error) {
 		}
 	}
 
+	// format.json文件不存在,创建相应的目录。
 	if len(s.formatData) == 0 {
 		// Create all necessary bucket folders if possible.
 		if err = makeFormatErasureMetaVolumes(s); err != nil {
@@ -1474,8 +1474,7 @@ func (s *xlStorage) readAllData(ctx context.Context, volumeDir string, filePath 
 	if err != nil {
 		switch {
 		case osIsNotExist(err):
-			// Check if the object doesn't exist because its bucket
-			// is missing in order to return the correct error.
+			// 检查文件不存在是否是由于其父目录(volume)不存在导致的。
 			if err = Access(volumeDir); err != nil && osIsNotExist(err) {
 				return nil, dmTime, errVolumeNotFound
 			}
@@ -1561,7 +1560,7 @@ func (s *xlStorage) ReadAll(ctx context.Context, volume string, path string) (bu
 		return nil, err
 	}
 
-	// Validate file path length, before reading.
+	// 校验filePath的长度是否合法
 	filePath := pathJoin(volumeDir, path)
 	if err = checkPathLength(filePath); err != nil {
 		return nil, err

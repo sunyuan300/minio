@@ -359,10 +359,11 @@ func newErasureSets(ctx context.Context, endpoints PoolEndpoints, storageDisks [
 		poolIndex:          poolIdx,
 	}
 
+	// 生成 namespace locker
 	mutex := newNSLock(globalIsDistErasure)
 
 	// Number of buffers, max 2GB
-	n := (2 * humanize.GiByte) / (blockSizeV2 * 2)
+	n := (2 * humanize.GiByte) / (blockSizeV2 * 2) // 1024
 
 	// Initialize byte pool once for all sets, bpool size is set to
 	// setCount * setDriveCount with each memory upto blockSizeV2.
@@ -372,7 +373,7 @@ func newErasureSets(ctx context.Context, endpoints PoolEndpoints, storageDisks [
 	// setCount * setDriveCount with each memory upto blockSizeV1
 	//
 	// Number of buffers, max 10GiB
-	m := (10 * humanize.GiByte) / (blockSizeV1 * 2)
+	m := (10 * humanize.GiByte) / (blockSizeV1 * 2) // 512
 
 	bpOld := bpool.NewBytePoolCap(m, blockSizeV1, blockSizeV1*2)
 
@@ -399,6 +400,7 @@ func newErasureSets(ctx context.Context, endpoints PoolEndpoints, storageDisks [
 		}
 	}
 
+	// 每个分组启动一个goroutine
 	var wg sync.WaitGroup
 	for i := 0; i < setCount; i++ {
 		wg.Add(1)
@@ -459,10 +461,10 @@ func newErasureSets(ctx context.Context, endpoints PoolEndpoints, storageDisks [
 
 	wg.Wait()
 
-	// start cleanup stale uploads go-routine.
+	// 清理旧数据.
 	go s.cleanupStaleUploads(ctx)
 
-	// start cleanup of deleted objects.
+	// 清理已删除的对象.
 	go s.cleanupDeletedObjects(ctx)
 
 	// Start the disk monitoring and connect routine.
@@ -1041,7 +1043,7 @@ func getHealDiskInfos(storageDisks []StorageAPI, errs []error) ([]DiskInfo, []er
 	return infos, g.Wait()
 }
 
-// Mark root disks as down so as not to heal them.
+// 将根磁盘(系统盘)和其它有问题的磁盘标记为关闭,避免被修复。
 func markRootDisksAsDown(storageDisks []StorageAPI, errs []error) {
 	if globalIsCICD {
 		// Do nothing
@@ -1049,10 +1051,12 @@ func markRootDisksAsDown(storageDisks []StorageAPI, errs []error) {
 	}
 	infos, ierrs := getHealDiskInfos(storageDisks, errs)
 	for i := range storageDisks {
+		// 将有问题的磁盘标记为关闭
 		if ierrs[i] != nil && ierrs[i] != errUnformattedDisk {
 			storageDisks[i] = nil
 			continue
 		}
+		// 将根磁盘标记为关闭
 		if storageDisks[i] != nil && infos[i].RootDisk {
 			// We should not heal on root disk. i.e in a situation where the minio-administrator has unmounted a
 			// defective drive we should not heal a path on the root disk.

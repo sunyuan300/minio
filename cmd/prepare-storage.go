@@ -147,7 +147,9 @@ func isServerResolvable(endpoint Endpoint, timeout time.Duration) error {
 // and are in quorum, if no formats are found attempt to initialize all of them for the first
 // time. additionally make sure to close all the disks used in this attempt.
 func connectLoadInitFormats(verboseLogging bool, firstDisk bool, endpoints Endpoints, poolCount, setCount, setDriveCount int, deploymentID, distributionAlgo string) (storageDisks []StorageAPI, format *formatErasureV3, err error) {
-	// Initialize all storage disks
+	// 初始化所有磁盘对应的client,同时需要做健康检查。
+	// 本地磁盘：使用xlStorageDiskIDCheck对象(嵌套xlStorage对象),本地磁盘的健康检查是清理旧数据。
+	// 远程磁盘：使用storageRESTClient对象
 	storageDisks, errs := initStorageDisksWithErrors(endpoints, true)
 
 	defer func(storageDisks []StorageAPI) {
@@ -178,7 +180,7 @@ func connectLoadInitFormats(verboseLogging bool, firstDisk bool, endpoints Endpo
 		return nil, nil, err
 	}
 
-	// Attempt to load all `format.json` from all disks.
+	// 从所有disk中加载format.json,不需要进行修复
 	formatConfigs, sErrs := loadFormatErasureAll(storageDisks, false)
 	// Check if we have
 	for i, sErr := range sErrs {
@@ -190,35 +192,29 @@ func connectLoadInitFormats(verboseLogging bool, firstDisk bool, endpoints Endpo
 		}
 	}
 
-	// Pre-emptively check if one of the formatted disks
-	// is invalid. This function returns success for the
-	// most part unless one of the formats is not consistent
-	// with expected Erasure format. For example if a user is
-	// trying to pool FS backend into an Erasure set.
+	// 检查已经格式化的磁盘的format值是否合法。
 	if err = checkFormatErasureValues(formatConfigs, storageDisks, setDriveCount); err != nil {
 		return nil, nil, err
 	}
 
-	// Return error when quorum unformatted disks - indicating we are
-	// waiting for first server to be online.
+	// 节点不是第一块磁盘且超过半数节点未格式化,直接返错(等待第一块磁盘启动)
 	unformattedDisks := quorumUnformattedDisks(sErrs)
 	if unformattedDisks && !firstDisk {
 		return nil, nil, errNotFirstDisk
 	}
 
-	// All disks report unformatted we should initialized everyone.
+	// 所有磁盘都未被格式化(所有磁盘只能由第一块磁盘进行格式化)
 	if unformattedDisks && firstDisk {
 		logger.Info("Formatting %s pool, %v set(s), %v drives per set.",
 			humanize.Ordinal(poolCount), setCount, setDriveCount)
 
-		// Initialize erasure code format on disks
+		// 格式化所有磁盘
 		format, err = initFormatErasure(GlobalContext, storageDisks, setCount, setDriveCount, deploymentID, distributionAlgo, sErrs)
 		if err != nil {
 			return nil, nil, err
 		}
 
-		// Assign globalDeploymentID on first run for the
-		// minio server managing the first disk
+		// 分配全局部署ID
 		globalDeploymentID = format.ID
 		return storageDisks, format, nil
 	}
@@ -236,7 +232,7 @@ func connectLoadInitFormats(verboseLogging bool, firstDisk bool, endpoints Endpo
 		return nil, nil, err
 	}
 
-	// If any of the .This field is still empty, we return error.
+	// 检查 .This(磁盘ID) 字段是否为空
 	if formatErasureV3ThisEmpty(formatConfigs) {
 		return nil, nil, errErasureV3ThisEmpty
 	}

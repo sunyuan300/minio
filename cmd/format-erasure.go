@@ -187,11 +187,10 @@ func formatGetBackendErasureVersion(b []byte) (string, error) {
 	return format.Erasure.Version, nil
 }
 
-// Migrates all previous versions to latest version of `format.json`,
-// this code calls migration in sequence, such as V1 is migrated to V2
-// first before it V2 migrates to V3.n
+// 将所有以前的版本迁移到最新版本的`format.json`，此代码按顺序调用迁移，
+// 例如V1先迁移到V2，然后V2迁移到V3.n。
 func formatErasureMigrate(export string) ([]byte, fs.FileInfo, error) {
-	formatPath := pathJoin(export, minioMetaBucket, formatConfigFile)
+	formatPath := pathJoin(export, minioMetaBucket, formatConfigFile) // path/.minio.sys/format.json
 	formatData, formatFi, err := xioutil.ReadFileWithFileInfo(formatPath)
 	if err != nil {
 		return nil, nil, err
@@ -304,20 +303,18 @@ func countErrs(errs []error, err error) int {
 	return i
 }
 
-// Check if unformatted disks are equal to write quorum.
+// 检查未格式化的磁盘是否超过半数
 func quorumUnformattedDisks(errs []error) bool {
 	return countErrs(errs, errUnformattedDisk) >= (len(errs)/2)+1
 }
 
 // loadFormatErasureAll - load all format config from all input disks in parallel.
 func loadFormatErasureAll(storageDisks []StorageAPI, heal bool) ([]*formatErasureV3, []error) {
-	// Initialize list of errors.
 	g := errgroup.WithNErrs(len(storageDisks))
 
-	// Initialize format configs.
 	formats := make([]*formatErasureV3, len(storageDisks))
 
-	// Load format from each disk in parallel
+	// 并发从每个disk中获取format
 	for index := range storageDisks {
 		index := index
 		g.Go(func() error {
@@ -330,15 +327,13 @@ func loadFormatErasureAll(storageDisks []StorageAPI, heal bool) ([]*formatErasur
 			}
 			formats[index] = format
 			if !heal {
-				// If no healing required, make the disks valid and
-				// online.
+				// 如果不需要修复,将磁盘标记为有valid和online。
 				storageDisks[index].SetDiskID(format.Erasure.This)
 			}
 			return nil
 		}, index)
 	}
 
-	// Return all formats and errors if any.
 	return formats, g.Wait()
 }
 
@@ -349,6 +344,7 @@ func saveFormatErasure(disk StorageAPI, format *formatErasureV3, healID string) 
 
 	diskID := format.Erasure.This
 
+	// 创建对应的meta目录
 	if err := makeFormatErasureMetaVolumes(disk); err != nil {
 		return err
 	}
@@ -359,6 +355,7 @@ func saveFormatErasure(disk StorageAPI, format *formatErasureV3, healID string) 
 		return err
 	}
 
+	// 生成临时文件名称
 	tmpFormat := mustGetUUID()
 
 	// Purge any existing temporary file, okay to ignore errors here.
@@ -372,7 +369,7 @@ func saveFormatErasure(disk StorageAPI, format *formatErasureV3, healID string) 
 		return err
 	}
 
-	// Rename file `uuid.json` --> `format.json`.
+	// 重命名文件 `uuid.json` --> `format.json`.
 	if err = disk.RenameFile(context.TODO(), minioMetaBucket, tmpFormat, minioMetaBucket, formatConfigFile); err != nil {
 		return err
 	}
@@ -386,25 +383,22 @@ func saveFormatErasure(disk StorageAPI, format *formatErasureV3, healID string) 
 	return nil
 }
 
-// loadFormatErasure - loads format.json from disk.
+// loadFormatErasure - 从磁盘上加载format.json文件
 func loadFormatErasure(disk StorageAPI) (format *formatErasureV3, err error) {
 	buf, err := disk.ReadAll(context.TODO(), minioMetaBucket, formatConfigFile)
 	if err != nil {
-		// 'file not found' and 'volume not found' as
-		// same. 'volume not found' usually means its a fresh disk.
+		// 'volume not found' 通常意味着这是一块新的磁盘.
 		if err == errFileNotFound || err == errVolumeNotFound {
 			return nil, errUnformattedDisk
 		}
 		return nil, err
 	}
 
-	// Try to decode format json into formatConfigV1 struct.
 	format = &formatErasureV3{}
 	if err = json.Unmarshal(buf, format); err != nil {
 		return nil, err
 	}
 
-	// Success.
 	return format, nil
 }
 
@@ -732,7 +726,7 @@ func fixFormatErasureV3(storageDisks []StorageAPI, endpoints Endpoints, formats 
 	return nil
 }
 
-// initFormatErasure - save Erasure format configuration on all disks.
+// initFormatErasure - 在所有磁盘上保存 Erasure format 配置.
 func initFormatErasure(ctx context.Context, storageDisks []StorageAPI, setCount, setDriveCount int, deploymentID, distributionAlgo string, sErrs []error) (*formatErasureV3, error) {
 	format := newFormatErasureV3(setCount, setDriveCount)
 	formats := make([]*formatErasureV3, len(storageDisks))

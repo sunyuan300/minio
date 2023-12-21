@@ -1161,6 +1161,7 @@ func (s *storageRESTServer) VerifyFileHandler(w http.ResponseWriter, r *http.Req
 	encoder.Encode(vresp)
 }
 
+// 如果所有错误都是相同的错误，则返回这个错误。
 func checkDiskFatalErrs(errs []error) error {
 	// This returns a common error if all errors are
 	// same errors, then there is no point starting

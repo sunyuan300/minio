@@ -101,6 +101,7 @@ func newErasureServerPools(ctx context.Context, endpointServerPools EndpointServ
 			return nil, fmt.Errorf("parity validation returned an error: %w <- (%d, %d), for pool(%s)", err, commonParityDrives, ep.DrivesPerSet, humanize.Ordinal(i+1))
 		}
 
+		// 进行磁盘格式化
 		storageDisks[i], formats[i], err = waitForFormatErasure(local, ep.Endpoints, i+1,
 			ep.SetCount, ep.DrivesPerSet, deploymentID, distributionAlgo)
 		if err != nil {
@@ -127,6 +128,7 @@ func newErasureServerPools(ctx context.Context, endpointServerPools EndpointServ
 			return nil, fmt.Errorf("all pools must have same deployment ID - expected %s, got %s for pool(%s)", deploymentID, formats[i].ID, humanize.Ordinal(i+1))
 		}
 
+		// 生成serverPool对应的erasureSets实例并启动相应的后台goroutine.
 		z.serverPools[i], err = newErasureSets(ctx, ep, storageDisks[i], formats[i], commonParityDrives, i)
 		if err != nil {
 			return nil, err
