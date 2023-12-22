@@ -196,6 +196,9 @@ func registerAPIRouter(router *mux.Router) {
 	apiRouter := router.PathPrefix(SlashSeparator).Subrouter()
 
 	var routers []*mux.Router
+	// 对象存储支持以下两种格式的访问方式:
+	// 1: https://{bucket}.region.domain.com
+	// 2: https://region.domain.com/{bucket}
 	for _, domainName := range globalDomainNames {
 		if IsKubernetes() {
 			routers = append(routers, apiRouter.MatcherFunc(func(r *http.Request, match *mux.RouteMatch) bool {
@@ -222,6 +225,7 @@ func registerAPIRouter(router *mux.Router) {
 	}
 	routers = append(routers, apiRouter.PathPrefix("/{bucket}").Subrouter())
 
+	// 压缩
 	gz, err := gzhttp.NewWrapper(gzhttp.MinSize(1000), gzhttp.CompressionLevel(gzip.BestSpeed))
 	if err != nil {
 		// Static params, so this is very unlikely.
@@ -237,7 +241,7 @@ func registerAPIRouter(router *mux.Router) {
 			t.Path(r.path)
 		}
 
-		// Object operations
+		// 对象相关的操作
 		// HeadObject
 		router.Methods(http.MethodHead).Path("/{object:.+}").HandlerFunc(
 			collectAPIStats("headobject", maxClients(gz(httpTraceAll(api.HeadObjectHandler)))))
@@ -317,15 +321,15 @@ func registerAPIRouter(router *mux.Router) {
 		router.Methods(http.MethodPost).Path("/{object:.+}").HandlerFunc(
 			collectAPIStats("restoreobject", maxClients(gz(httpTraceAll(api.PostRestoreObjectHandler))))).Queries("restore", "")
 
-		// Bucket operations
+		// 桶相关的操作
 
-		// GetBucketLocation
+		// 获取桶的位置
 		router.Methods(http.MethodGet).HandlerFunc(
 			collectAPIStats("getbucketlocation", maxClients(gz(httpTraceAll(api.GetBucketLocationHandler))))).Queries("location", "")
-		// GetBucketPolicy
+		// 获取桶的策略
 		router.Methods(http.MethodGet).HandlerFunc(
 			collectAPIStats("getbucketpolicy", maxClients(gz(httpTraceAll(api.GetBucketPolicyHandler))))).Queries("policy", "")
-		// GetBucketLifecycle
+		// 获取桶的生命周期
 		router.Methods(http.MethodGet).HandlerFunc(
 			collectAPIStats("getbucketlifecycle", maxClients(gz(httpTraceAll(api.GetBucketLifecycleHandler))))).Queries("lifecycle", "")
 		// GetBucketEncryption
@@ -430,7 +434,7 @@ func registerAPIRouter(router *mux.Router) {
 		router.Methods(http.MethodPut).HandlerFunc(
 			collectAPIStats("resetbucketreplicationstart", maxClients(gz(httpTraceAll(api.ResetBucketReplicationStartHandler))))).Queries("replication-reset", "")
 
-		// PutBucket
+		// 创建桶
 		router.Methods(http.MethodPut).HandlerFunc(
 			collectAPIStats("putbucket", maxClients(gz(httpTraceAll(api.PutBucketHandler)))))
 		// HeadBucket
