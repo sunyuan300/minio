@@ -2155,11 +2155,13 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 		}
 	}()
 
+	// /disk/src-bucket/
 	srcVolumeDir, err := s.getVolDir(srcVolume)
 	if err != nil {
 		return 0, err
 	}
 
+	// /disk/dst-bucket/
 	dstVolumeDir, err := s.getVolDir(dstVolume)
 	if err != nil {
 		return 0, err
@@ -2188,6 +2190,9 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 		}
 	}
 
+	// 元数据的存储路径
+	// srcMetaPath:	/disk/.minio.sys/tmp/object-uuid/xl.meta
+	// dstMetaPath:	/disk/bucket-name/object-name/xl.meta
 	srcFilePath := pathutil.Join(srcVolumeDir, pathJoin(srcPath, xlStorageFormatFile))
 	dstFilePath := pathutil.Join(dstVolumeDir, pathJoin(dstPath, xlStorageFormatFile))
 
@@ -2197,6 +2202,10 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 	if !fi.IsRemote() {
 		dataDir = retainSlash(fi.DataDir)
 	}
+
+	// 对象数据的存储路径
+	// srcDataPath:	/disk/.minio.sys/tmp/object-uuid/dataDir/
+	// dstDataPath: /disk/bucket-name/object-name/dataDir/
 	if dataDir != "" {
 		srcDataPath = retainSlash(pathJoin(srcVolumeDir, srcPath, dataDir))
 		// make sure to always use path.Join here, do not use pathJoin as
@@ -2213,6 +2222,7 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 		return 0, err
 	}
 
+	// 读取元数据(正常情况下应该是文件不存在)
 	dstBuf, err := xioutil.ReadFile(dstFilePath)
 	if err != nil {
 		// handle situations when dstFilePath is 'file'
@@ -2228,6 +2238,7 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 			return 0, osErrToFileErr(err)
 		}
 		// errFileNotFound comes here.
+		// 将旧版本的xl.json重命名为xl.meta
 		err = s.renameLegacyMetadata(dstVolumeDir, dstPath)
 		if err != nil && err != errFileNotFound {
 			return 0, err
@@ -2396,6 +2407,7 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 	}
 
 	if srcDataPath != "" {
+		// 将元数据写入临时tmp目录	/disk/.minio.sys/tmp/object-uuid/xl.meta
 		if err = s.WriteAll(ctx, srcVolume, pathJoin(srcPath, xlStorageFormatFile), dstBuf); err != nil {
 			if legacyPreserved {
 				// Any failed rename calls un-roll previous transaction.
@@ -2407,6 +2419,7 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 
 		// renameAll only for objects that have xl.meta not saved inline.
 		if len(fi.Data) == 0 && fi.Size > 0 {
+			// 将旧的对象数据(如果存在)移到垃圾回收站
 			s.moveToTrash(dstDataPath, true, false)
 			if healing {
 				// If we are healing we should purge any legacyDataPath content,
@@ -2414,17 +2427,20 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 				// on a versioned bucket.
 				s.moveToTrash(legacyDataPath, true, false)
 			}
+			// 将临时tmp目录的对象数据移到指定的桶中
 			if err = renameAll(srcDataPath, dstDataPath); err != nil {
 				if legacyPreserved {
 					// Any failed rename calls un-roll previous transaction.
 					s.deleteFile(dstVolumeDir, legacyDataPath, true, false)
 				}
+				// rename失败,删除桶中的对象数据(临时tmp目录下的对象数据和元数据还存在)
 				s.deleteFile(dstVolumeDir, dstDataPath, false, false)
 				return 0, osErrToFileErr(err)
 			}
 		}
 
 		// Commit meta-file
+		// 将临时目录中的元数据移动到指定的桶中
 		if err = renameAll(srcFilePath, dstFilePath); err != nil {
 			if legacyPreserved {
 				// Any failed rename calls un-roll previous transaction.
@@ -2442,6 +2458,7 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 		}
 	} else {
 		// Write meta-file directly, no data
+		// 直接将元数据写到桶中,不需要写对象数据。
 		if err = s.WriteAll(ctx, dstVolume, pathJoin(dstPath, xlStorageFormatFile), dstBuf); err != nil {
 			if legacyPreserved {
 				// Any failed rename calls un-roll previous transaction.

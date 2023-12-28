@@ -711,6 +711,7 @@ func (api objectAPIHandlers) PutBucketHandler(w http.ResponseWriter, r *http.Req
 	vars := mux.Vars(r)
 	bucket := vars["bucket"]
 
+	// 是否开启对象锁
 	objectLockEnabled := false
 	if vs := r.Header.Get(xhttp.AmzObjectLockEnabled); len(vs) > 0 {
 		v := strings.ToLower(vs)
@@ -723,6 +724,7 @@ func (api objectAPIHandlers) PutBucketHandler(w http.ResponseWriter, r *http.Req
 		}
 	}
 
+	// 是否强制创建
 	forceCreate := false
 	if vs := r.Header.Get(xhttp.MinIOForceCreate); len(vs) > 0 {
 		v := strings.ToLower(vs)
@@ -735,12 +737,14 @@ func (api objectAPIHandlers) PutBucketHandler(w http.ResponseWriter, r *http.Req
 		}
 	}
 
+	// 身份认证与鉴权
 	cred, owner, s3Error := checkRequestAuthTypeCredential(ctx, r, policy.CreateBucketAction)
 	if s3Error != ErrNone {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
 		return
 	}
 
+	// 创建带锁的bucket需要有更多的权限
 	if objectLockEnabled {
 		// Creating a bucket with locking requires the user having more permissions
 		for _, action := range []iampolicy.Action{iampolicy.PutBucketObjectLockConfigurationAction, iampolicy.PutBucketVersioningAction} {
@@ -759,18 +763,19 @@ func (api objectAPIHandlers) PutBucketHandler(w http.ResponseWriter, r *http.Req
 		}
 	}
 
-	// Parse incoming location constraint.
+	// 解析region
 	_, s3Error = parseLocationConstraint(r)
 	if s3Error != ErrNone {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
 		return
 	}
 
-	// check if client is attempting to create more buckets, complain about it.
+	// 检查桶数量是否超过50w
 	if currBuckets := globalBucketMetadataSys.Count(); currBuckets+1 > maxBuckets {
 		logger.LogIf(ctx, fmt.Errorf("An attempt to create %d buckets beyond recommended %d", currBuckets+1, maxBuckets))
 	}
 
+	// 初始创建桶的options
 	opts := MakeBucketOptions{
 		LockEnabled: objectLockEnabled,
 		ForceCreate: forceCreate,
@@ -832,7 +837,7 @@ func (api objectAPIHandlers) PutBucketHandler(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// Proceed to creating a bucket.
+	// 开始创建桶
 	if err := objectAPI.MakeBucket(ctx, bucket, opts); err != nil {
 		if _, ok := err.(BucketExists); ok {
 			// Though bucket exists locally, we send the site-replication
@@ -845,7 +850,7 @@ func (api objectAPIHandlers) PutBucketHandler(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// Load updated bucket metadata into memory.
+	// 将桶的meta加载到内存
 	globalNotificationSys.LoadBucketMetadata(GlobalContext, bucket)
 
 	// Call site replication hook
