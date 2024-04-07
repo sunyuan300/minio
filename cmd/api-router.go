@@ -309,11 +309,11 @@ func registerAPIRouter(router *mux.Router) {
 		router.Methods(http.MethodPut).Path("/{object:.+}").HeadersRegexp(xhttp.AmzSnowballExtract, "true").HandlerFunc(
 			collectAPIStats("putobject", maxClients(gz(httpTraceHdrs(api.PutObjectExtractHandler)))))
 
-		// PutObject
+		// PutObject 上传对象
 		router.Methods(http.MethodPut).Path("/{object:.+}").HandlerFunc(
 			collectAPIStats("putobject", maxClients(gz(httpTraceHdrs(api.PutObjectHandler)))))
 
-		// DeleteObject
+		// DeleteObject 删除对象
 		router.Methods(http.MethodDelete).Path("/{object:.+}").HandlerFunc(
 			collectAPIStats("deleteobject", maxClients(gz(httpTraceAll(api.DeleteObjectHandler)))))
 

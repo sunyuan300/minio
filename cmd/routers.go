@@ -75,7 +75,7 @@ func configureServerHandler(endpointServerPools EndpointServerPools) (http.Handl
 	// normalizing URL path minio/minio#3256
 	router := mux.NewRouter().SkipClean(true).UseEncodedPath()
 
-	// Initialize distributed NS lock.
+	// 初始化分布式NS锁(仅分布式部署模式下)
 	if globalIsDistErasure {
 		registerDistErasureRouters(router, endpointServerPools)
 	}
@@ -83,19 +83,19 @@ func configureServerHandler(endpointServerPools EndpointServerPools) (http.Handl
 	// Add Admin router, all APIs are enabled in server mode.
 	registerAdminRouter(router, true)
 
-	// Add healthcheck router
+	// 注册健康检查相关的路由
 	registerHealthCheckRouter(router)
 
-	// Add server metrics router
+	// 注册服务器指标(metrics)相关的路由
 	registerMetricsRouter(router)
 
-	// Add STS router always.
+	// 注册 AWS STS 兼容的 API
 	registerSTSRouter(router)
 
-	// Add KMS router
+	// 注册KMS相关的路由
 	registerKMSRouter(router)
 
-	// Add API router
+	// 注册S3兼容的API
 	registerAPIRouter(router)
 
 	router.Use(globalHandlers...)

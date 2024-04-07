@@ -323,7 +323,7 @@ func initAllSubsystems(ctx context.Context) {
 	// Create new notification system
 	globalEventNotifier = NewEventNotifier()
 
-	// Create new bucket metadata system.
+	// 初始化桶元数据子系统(策略管理、生命周期管理、数据加密、数据保留、配额管理、版本控制等信息都保存在这儿).
 	if globalBucketMetadataSys == nil {
 		globalBucketMetadataSys = NewBucketMetadataSys()
 	} else {
@@ -331,31 +331,31 @@ func initAllSubsystems(ctx context.Context) {
 		globalBucketMetadataSys.Reset()
 	}
 
-	// Create the bucket bandwidth monitor
+	// 初始化桶带宽监控器
 	globalBucketMonitor = bandwidth.NewMonitor(ctx, totalNodeCount())
 
-	// Create a new config system.
+	// 初始化配置管理子系统
 	globalConfigSys = NewConfigSys()
 
-	// Create new IAM system.
+	// 初始化IAM子系统
 	globalIAMSys = NewIAMSys()
 
-	// Create new policy system.
+	// 初始化策略管理子系统
 	globalPolicySys = NewPolicySys()
 
-	// Create new lifecycle system.
+	// 初始化生命周期管理子系统
 	globalLifecycleSys = NewLifecycleSys()
 
-	// Create new bucket encryption subsystem
+	// 初始化桶加密管理子系统
 	globalBucketSSEConfigSys = NewBucketSSEConfigSys()
 
-	// Create new bucket object lock subsystem
+	// 初始化桶保留策略子系统(WORM)
 	globalBucketObjectLockSys = NewBucketObjectLockSys()
 
-	// Create new bucket quota subsystem
+	// 初始化桶配额管理子系统
 	globalBucketQuotaSys = NewBucketQuotaSys()
 
-	// Create new bucket versioning subsystem
+	// 初始化桶版本控制子系统
 	if globalBucketVersioningSys == nil {
 		globalBucketVersioningSys = NewBucketVersioningSys()
 	}
@@ -705,7 +705,7 @@ func serverMain(ctx *cli.Context) {
 
 	// 后台所有其他操作，例如初始化存储桶元数据等。
 	go func() {
-		// Initialize data scanner.
+		// 初始化数据扫描，用于实现生命周期管理功能.
 		initDataScanner(GlobalContext, newObject)
 
 		// Initialize background replication
@@ -716,7 +716,7 @@ func serverMain(ctx *cli.Context) {
 		// Initialize batch job pool.
 		globalBatchJobPool = newBatchJobPool(GlobalContext, newObject, 100)
 
-		// Initialize the license update job
+		// 启动一个独立的goroutine，用于定期更新license
 		initLicenseUpdateJob(GlobalContext, newObject)
 
 		go func() {
@@ -745,7 +745,7 @@ func serverMain(ctx *cli.Context) {
 			setCacheObjectLayer(cacheAPI)
 		}
 
-		// List buckets to heal, and be re-used for loading configs.
+		// 获取集群中所有的桶
 		buckets, err := newObject.ListBuckets(GlobalContext, BucketOptions{})
 		if err != nil {
 			logger.LogIf(GlobalContext, fmt.Errorf("Unable to list buckets to heal: %w", err))
@@ -753,7 +753,7 @@ func serverMain(ctx *cli.Context) {
 		// initialize replication resync state.
 		go globalReplicationPool.initResync(GlobalContext, buckets, newObject)
 
-		// Initialize bucket metadata sub-system.
+		// 初始化桶元数据子系统
 		globalBucketMetadataSys.Init(GlobalContext, buckets, newObject)
 
 		// Initialize site replication manager after bucket metadat

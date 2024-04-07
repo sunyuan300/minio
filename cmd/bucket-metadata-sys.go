@@ -437,7 +437,7 @@ func (sys *BucketMetadataSys) loadBucketMetadata(ctx context.Context, bucket Buc
 	return nil
 }
 
-// concurrently load bucket metadata to speed up loading bucket metadata.
+// 并发加载桶的元数据
 func (sys *BucketMetadataSys) concurrentLoad(ctx context.Context, buckets []BucketInfo) {
 	g := errgroup.WithNErrs(len(buckets))
 	bucketMetas := make([]BucketMetadata, len(buckets))
@@ -525,9 +525,9 @@ func (sys *BucketMetadataSys) refreshBucketsMetadataLoop(ctx context.Context) {
 	}
 }
 
-// Loads bucket metadata for all buckets into BucketMetadataSys.
+// 将所有桶的元数据加载到BucketMetadataSys中
 func (sys *BucketMetadataSys) init(ctx context.Context, buckets []BucketInfo) {
-	count := 100 // load 100 bucket metadata at a time.
+	count := 100 // 一次最多加载100个桶的元数据
 	for {
 		if len(buckets) < count {
 			sys.concurrentLoad(ctx, buckets)
