@@ -775,7 +775,7 @@ func (api objectAPIHandlers) PutBucketHandler(w http.ResponseWriter, r *http.Req
 		logger.LogIf(ctx, fmt.Errorf("An attempt to create %d buckets beyond recommended %d", currBuckets+1, maxBuckets))
 	}
 
-	// 初始创建桶的options
+	// 初始化创建桶的options
 	opts := MakeBucketOptions{
 		LockEnabled: objectLockEnabled,
 		ForceCreate: forceCreate,
