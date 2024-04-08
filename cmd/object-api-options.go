@@ -331,7 +331,7 @@ func putOpts(ctx context.Context, r *http.Request, bucket, object string, metada
 	opts.Versioned = versioned
 	opts.VersionSuspended = versionSuspended
 
-	// For directory objects skip creating new versions.
+	// 对于目录对象，跳过版本控制。
 	if isDirObject(object) && vid == "" {
 		opts.VersionID = nullVersionID
 	}
