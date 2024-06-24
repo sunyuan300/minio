@@ -745,7 +745,8 @@ func serverMain(ctx *cli.Context) {
 			setCacheObjectLayer(cacheAPI)
 		}
 
-		// 获取集群中所有的桶
+		// List buckets to heal, and be re-used for loading configs.
+		// 获取所有的桶(.minio.sys、minio桶除外)
 		buckets, err := newObject.ListBuckets(GlobalContext, BucketOptions{})
 		if err != nil {
 			logger.LogIf(GlobalContext, fmt.Errorf("Unable to list buckets to heal: %w", err))

@@ -754,7 +754,7 @@ func (z *erasureServerPools) MakeBucket(ctx context.Context, bucket string, opts
 		return err
 	}
 
-	// If it doesn't exist we get a new, so ignore errors
+	// 生成桶的meta
 	meta := newBucketMetadata(bucket)
 	meta.SetCreatedAt(opts.CreatedAt)
 	if opts.LockEnabled {
@@ -766,6 +766,7 @@ func (z *erasureServerPools) MakeBucket(ctx context.Context, bucket string, opts
 		meta.VersioningConfigXML = enabledBucketVersioningConfig
 	}
 
+	// 保存桶meta disk/.minio.sys/buckets/xxx/.metadata.bin/xl.meta
 	if err := meta.Save(context.Background(), z); err != nil {
 		return toObjectErr(err, bucket)
 	}
