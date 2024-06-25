@@ -214,9 +214,11 @@ func delOpts(ctx context.Context, r *http.Request, bucket, object string) (opts 
 
 // get ObjectOptions for PUT calls from encryption headers and metadata
 func putOpts(ctx context.Context, r *http.Request, bucket, object string, metadata map[string]string) (opts ObjectOptions, err error) {
+	// 从元数据中判断桶是否开启版本控制，并进一步判断是否已经暂停。
 	versioned := globalBucketVersioningSys.PrefixEnabled(bucket, object)
 	versionSuspended := globalBucketVersioningSys.PrefixSuspended(bucket, object)
 
+	// 从请求中判断是否携带"versionId". 如果携带,需要判断是否符合uuid格式.
 	vid := strings.TrimSpace(r.Form.Get(xhttp.VersionID))
 	if vid != "" && vid != nullVersionID {
 		_, err := uuid.Parse(vid)
@@ -331,7 +333,7 @@ func putOpts(ctx context.Context, r *http.Request, bucket, object string, metada
 	opts.Versioned = versioned
 	opts.VersionSuspended = versionSuspended
 
-	// 对于目录对象，跳过版本控制。
+	// 对于目录对象且请求中未携带版本控制uuid,跳过版本控制。
 	if isDirObject(object) && vid == "" {
 		opts.VersionID = nullVersionID
 	}

@@ -1080,11 +1080,13 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 	partsMetadata := make([]FileInfo, len(storageDisks))
 
 	fi := newFileInfo(pathJoin(bucket, object), dataDrives, parityDrives)
+	// 初始化版本控制的uuid,优先从请求中获取,否则随机生成
 	fi.VersionID = opts.VersionID
 	if opts.Versioned && fi.VersionID == "" {
 		fi.VersionID = mustGetUUID()
 	}
 
+	// 初始化dataDir的uuid
 	fi.DataDir = mustGetUUID()
 	fi.Checksum = opts.WantChecksum.AppendTo(nil, nil)
 	if opts.EncryptFn != nil {

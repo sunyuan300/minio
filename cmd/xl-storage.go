@@ -2155,7 +2155,7 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 		}
 	}()
 
-	// /disk/src-bucket/
+	// /disk/.minio/src-bucket/
 	srcVolumeDir, err := s.getVolDir(srcVolume)
 	if err != nil {
 		return 0, err
@@ -2191,7 +2191,7 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 	}
 
 	// 元数据的存储路径
-	// srcMetaPath:	/disk/.minio.sys/tmp/object-uuid/xl.meta
+	// srcMetaPath:	/disk/.minio.sys/tmp/uuid/xl.meta
 	// dstMetaPath:	/disk/bucket-name/object-name/xl.meta
 	srcFilePath := pathutil.Join(srcVolumeDir, pathJoin(srcPath, xlStorageFormatFile))
 	dstFilePath := pathutil.Join(dstVolumeDir, pathJoin(dstPath, xlStorageFormatFile))
@@ -2204,8 +2204,8 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 	}
 
 	// 对象数据的存储路径
-	// srcDataPath:	/disk/.minio.sys/tmp/object-uuid/dataDir/
-	// dstDataPath: /disk/bucket-name/object-name/dataDir/
+	// srcDataPath:	/disk/.minio.sys/tmp/uuid/uuid/
+	// dstDataPath: /disk/bucket-name/object-name/uuid/
 	if dataDir != "" {
 		srcDataPath = retainSlash(pathJoin(srcVolumeDir, srcPath, dataDir))
 		// make sure to always use path.Join here, do not use pathJoin as
@@ -2407,7 +2407,7 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 	}
 
 	if srcDataPath != "" {
-		// 将元数据写入临时tmp目录	/disk/.minio.sys/tmp/object-uuid/xl.meta
+		// 将元数据写入临时tmp目录	/disk/.minio.sys/tmp/uuid/xl.meta
 		if err = s.WriteAll(ctx, srcVolume, pathJoin(srcPath, xlStorageFormatFile), dstBuf); err != nil {
 			if legacyPreserved {
 				// Any failed rename calls un-roll previous transaction.
