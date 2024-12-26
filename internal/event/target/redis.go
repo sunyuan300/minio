@@ -31,8 +31,9 @@ import (
 	"github.com/gomodule/redigo/redis"
 	"github.com/minio/minio/internal/event"
 	"github.com/minio/minio/internal/logger"
+	"github.com/minio/minio/internal/once"
 	"github.com/minio/minio/internal/store"
-	xnet "github.com/minio/pkg/net"
+	xnet "github.com/minio/pkg/v3/net"
 )
 
 // Redis constants
@@ -40,6 +41,7 @@ const (
 	RedisFormat     = "format"
 	RedisAddress    = "address"
 	RedisPassword   = "password"
+	RedisUser       = "user"
 	RedisKey        = "key"
 	RedisQueueDir   = "queue_dir"
 	RedisQueueLimit = "queue_limit"
@@ -48,6 +50,7 @@ const (
 	EnvRedisFormat     = "MINIO_NOTIFY_REDIS_FORMAT"
 	EnvRedisAddress    = "MINIO_NOTIFY_REDIS_ADDRESS"
 	EnvRedisPassword   = "MINIO_NOTIFY_REDIS_PASSWORD"
+	EnvRedisUser       = "MINIO_NOTIFY_REDIS_USER"
 	EnvRedisKey        = "MINIO_NOTIFY_REDIS_KEY"
 	EnvRedisQueueDir   = "MINIO_NOTIFY_REDIS_QUEUE_DIR"
 	EnvRedisQueueLimit = "MINIO_NOTIFY_REDIS_QUEUE_LIMIT"
@@ -59,6 +62,7 @@ type RedisArgs struct {
 	Format     string    `json:"format"`
 	Addr       xnet.Host `json:"address"`
 	Password   string    `json:"password"`
+	User       string    `json:"user"`
 	Key        string    `json:"key"`
 	QueueDir   string    `json:"queueDir"`
 	QueueLimit uint64    `json:"queueLimit"`
@@ -118,7 +122,7 @@ func (r RedisArgs) validateFormat(c redis.Conn) error {
 
 // RedisTarget - Redis target.
 type RedisTarget struct {
-	lazyInit lazyInit
+	initOnce once.Init
 
 	id         event.TargetID
 	args       RedisArgs
@@ -169,7 +173,8 @@ func (target *RedisTarget) isActive() (bool, error) {
 // Save - saves the events to the store if questore is configured, which will be replayed when the redis connection is active.
 func (target *RedisTarget) Save(eventData event.Event) error {
 	if target.store != nil {
-		return target.store.Put(eventData)
+		_, err := target.store.Put(eventData)
+		return err
 	}
 	if err := target.init(); err != nil {
 		return err
@@ -221,8 +226,8 @@ func (target *RedisTarget) send(eventData event.Event) error {
 	return nil
 }
 
-// Send - reads an event from store and sends it to redis.
-func (target *RedisTarget) Send(eventKey string) error {
+// SendFromStore - reads an event from store and sends it to redis.
+func (target *RedisTarget) SendFromStore(key store.Key) error {
 	if err := target.init(); err != nil {
 		return err
 	}
@@ -248,7 +253,7 @@ func (target *RedisTarget) Send(eventKey string) error {
 		target.firstPing = true
 	}
 
-	eventData, eErr := target.store.Get(eventKey)
+	eventData, eErr := target.store.Get(key)
 	if eErr != nil {
 		// The last event key in a successful batch will be sent in the channel atmost once by the replayEvents()
 		// Such events will not exist and would've been already been sent successfully.
@@ -266,17 +271,20 @@ func (target *RedisTarget) Send(eventKey string) error {
 	}
 
 	// Delete the event from store.
-	return target.store.Del(eventKey)
+	return target.store.Del(key)
 }
 
 // Close - releases the resources used by the pool.
 func (target *RedisTarget) Close() error {
 	close(target.quitCh)
-	return target.pool.Close()
+	if target.pool != nil {
+		return target.pool.Close()
+	}
+	return nil
 }
 
 func (target *RedisTarget) init() error {
-	return target.lazyInit.Do(target.initRedis)
+	return target.initOnce.Do(target.initRedis)
 }
 
 func (target *RedisTarget) initRedis() error {
@@ -330,9 +338,16 @@ func NewRedisTarget(id string, args RedisArgs, loggerOnce logger.LogOnce) (*Redi
 			}
 
 			if args.Password != "" {
-				if _, err = conn.Do("AUTH", args.Password); err != nil {
-					conn.Close()
-					return nil, err
+				if args.User != "" {
+					if _, err = conn.Do("AUTH", args.User, args.Password); err != nil {
+						conn.Close()
+						return nil, err
+					}
+				} else {
+					if _, err = conn.Do("AUTH", args.Password); err != nil {
+						conn.Close()
+						return nil, err
+					}
 				}
 			}
 

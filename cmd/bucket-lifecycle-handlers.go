@@ -21,12 +21,14 @@ import (
 	"encoding/xml"
 	"io"
 	"net/http"
+	"strconv"
+	"time"
 
 	"github.com/minio/minio/internal/bucket/lifecycle"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/mux"
-	"github.com/minio/pkg/bucket/policy"
+	"github.com/minio/pkg/v3/policy"
 )
 
 const (
@@ -62,7 +64,8 @@ func (api objectAPIHandlers) PutBucketLifecycleHandler(w http.ResponseWriter, r 
 	}
 
 	// Check if bucket exists.
-	if _, err := objAPI.GetBucketInfo(ctx, bucket, BucketOptions{}); err != nil {
+	rcfg, err := globalBucketObjectLockSys.Get(bucket)
+	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
@@ -74,7 +77,7 @@ func (api objectAPIHandlers) PutBucketLifecycleHandler(w http.ResponseWriter, r 
 	}
 
 	// Validate the received bucket policy document
-	if err = bucketLifecycle.Validate(); err != nil {
+	if err = bucketLifecycle.Validate(rcfg); err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
@@ -83,6 +86,41 @@ func (api objectAPIHandlers) PutBucketLifecycleHandler(w http.ResponseWriter, r 
 	if err = validateTransitionTier(bucketLifecycle); err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
+	}
+
+	// Create a map of updated set of rules in request
+	updatedRules := make(map[string]lifecycle.Rule, len(bucketLifecycle.Rules))
+	for _, rule := range bucketLifecycle.Rules {
+		updatedRules[rule.ID] = rule
+	}
+
+	// Get list of rules for the bucket from disk
+	meta, err := globalBucketMetadataSys.GetConfigFromDisk(ctx, bucket)
+	if err != nil {
+		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+		return
+	}
+	expiryRuleRemoved := false
+	if len(meta.LifecycleConfigXML) > 0 {
+		var lcCfg lifecycle.Lifecycle
+		if err := xml.Unmarshal(meta.LifecycleConfigXML, &lcCfg); err != nil {
+			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+			return
+		}
+		for _, rl := range lcCfg.Rules {
+			updRule, ok := updatedRules[rl.ID]
+			// original rule had expiry that is no longer in the new config,
+			// or rule is present but missing expiration flags
+			if (!rl.Expiration.IsNull() || !rl.NoncurrentVersionExpiration.IsNull()) &&
+				(!ok || (updRule.Expiration.IsNull() && updRule.NoncurrentVersionExpiration.IsNull())) {
+				expiryRuleRemoved = true
+			}
+		}
+	}
+
+	if bucketLifecycle.HasExpiry() || expiryRuleRemoved {
+		currtime := time.Now()
+		bucketLifecycle.ExpiryUpdatedAt = &currtime
 	}
 
 	configData, err := xml.Marshal(bucketLifecycle)
@@ -115,6 +153,16 @@ func (api objectAPIHandlers) GetBucketLifecycleHandler(w http.ResponseWriter, r 
 	vars := mux.Vars(r)
 	bucket := vars["bucket"]
 
+	var withUpdatedAt bool
+	if updatedAtStr := r.Form.Get("withUpdatedAt"); updatedAtStr != "" {
+		var err error
+		withUpdatedAt, err = strconv.ParseBool(updatedAtStr)
+		if err != nil {
+			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrInvalidLifecycleQueryParameter), r.URL)
+			return
+		}
+	}
+
 	if s3Error := checkRequestAuthType(ctx, r, policy.GetBucketLifecycleAction, bucket, ""); s3Error != ErrNone {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
 		return
@@ -126,11 +174,13 @@ func (api objectAPIHandlers) GetBucketLifecycleHandler(w http.ResponseWriter, r 
 		return
 	}
 
-	config, err := globalBucketMetadataSys.GetLifecycleConfig(bucket)
+	config, updatedAt, err := globalBucketMetadataSys.GetLifecycleConfig(bucket)
 	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
+	// explicitly set ExpiryUpdatedAt nil as its meant for internal consumption only
+	config.ExpiryUpdatedAt = nil
 
 	configData, err := xml.Marshal(config)
 	if err != nil {
@@ -138,6 +188,9 @@ func (api objectAPIHandlers) GetBucketLifecycleHandler(w http.ResponseWriter, r 
 		return
 	}
 
+	if withUpdatedAt {
+		w.Header().Set(xhttp.MinIOLifecycleCfgUpdatedAt, updatedAt.Format(iso8601Format))
+	}
 	// Write lifecycle configuration to client.
 	writeSuccessResponseXML(w, configData)
 }

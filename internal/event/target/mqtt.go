@@ -31,8 +31,9 @@ import (
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 	"github.com/minio/minio/internal/event"
 	"github.com/minio/minio/internal/logger"
+	"github.com/minio/minio/internal/once"
 	"github.com/minio/minio/internal/store"
-	xnet "github.com/minio/pkg/net"
+	xnet "github.com/minio/pkg/v3/net"
 )
 
 const (
@@ -107,7 +108,7 @@ func (m MQTTArgs) Validate() error {
 
 // MQTTTarget - MQTT target.
 type MQTTTarget struct {
-	lazyInit lazyInit
+	initOnce once.Init
 
 	id         event.TargetID
 	args       MQTTArgs
@@ -167,8 +168,8 @@ func (target *MQTTTarget) send(eventData event.Event) error {
 	return token.Error()
 }
 
-// Send - reads an event from store and sends it to MQTT.
-func (target *MQTTTarget) Send(eventKey string) error {
+// SendFromStore - reads an event from store and sends it to MQTT.
+func (target *MQTTTarget) SendFromStore(key store.Key) error {
 	if err := target.init(); err != nil {
 		return err
 	}
@@ -179,7 +180,7 @@ func (target *MQTTTarget) Send(eventKey string) error {
 		return err
 	}
 
-	eventData, err := target.store.Get(eventKey)
+	eventData, err := target.store.Get(key)
 	if err != nil {
 		// The last event key in a successful batch will be sent in the channel atmost once by the replayEvents()
 		// Such events will not exist and wouldve been already been sent successfully.
@@ -194,14 +195,15 @@ func (target *MQTTTarget) Send(eventKey string) error {
 	}
 
 	// Delete the event from store.
-	return target.store.Del(eventKey)
+	return target.store.Del(key)
 }
 
 // Save - saves the events to the store if queuestore is configured, which will
 // be replayed when the mqtt connection is active.
 func (target *MQTTTarget) Save(eventData event.Event) error {
 	if target.store != nil {
-		return target.store.Put(eventData)
+		_, err := target.store.Put(eventData)
+		return err
 	}
 	if err := target.init(); err != nil {
 		return err
@@ -218,13 +220,15 @@ func (target *MQTTTarget) Save(eventData event.Event) error {
 
 // Close - does nothing and available for interface compatibility.
 func (target *MQTTTarget) Close() error {
-	target.client.Disconnect(100)
+	if target.client != nil {
+		target.client.Disconnect(100)
+	}
 	close(target.quitCh)
 	return nil
 }
 
 func (target *MQTTTarget) init() error {
-	return target.lazyInit.Do(target.initMQTT)
+	return target.initOnce.Do(target.initMQTT)
 }
 
 func (target *MQTTTarget) initMQTT() error {

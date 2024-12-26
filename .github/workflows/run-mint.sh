@@ -7,45 +7,60 @@ export ACCESS_KEY="$2"
 export SECRET_KEY="$3"
 export JOB_NAME="$4"
 export MINT_MODE="full"
+export MINT_NO_FULL_OBJECT="true"
 
-docker system prune -f
-docker volume prune -f
+docker system prune -f || true
+docker volume prune -f || true
+docker volume rm $(docker volume ls -f dangling=true) || true
 
 ## change working directory
 cd .github/workflows/mint
 
-docker-compose -f minio-${MODE}.yaml up -d
-sleep 5m
+## always pull latest
+docker pull docker.io/minio/mint:edge
 
-docker run --rm --net=host \
-       --name="mint-${MODE}-${JOB_NAME}" \
-       -e SERVER_ENDPOINT="127.0.0.1:9000" \
-       -e ACCESS_KEY="${ACCESS_KEY}" \
-       -e SECRET_KEY="${SECRET_KEY}" \
-       -e ENABLE_HTTPS=0 \
-       -e MINT_MODE="${MINT_MODE}" \
-       docker.io/minio/mint:edge \
-	 aws-sdk-go   \
-	 aws-sdk-java \
-	 aws-sdk-php  \
-	 aws-sdk-ruby \
-	 awscli       \
-	 healthcheck  \
-	 mc           \
-	 minio-go     \
-	 minio-java   \
-	 minio-js     \
-	 minio-py     \
-	 s3cmd        \
-	 s3select     \
-	 versioning
+docker-compose -f minio-${MODE}.yaml up -d
+sleep 1m
+
+docker system prune -f || true
+docker volume prune -f || true
+docker volume rm $(docker volume ls -q -f dangling=true) || true
+
+# Stop two nodes, one of each pool, to check that all S3 calls work while quorum is still there
+[ "${MODE}" == "pools" ] && docker-compose -f minio-${MODE}.yaml stop minio2
+[ "${MODE}" == "pools" ] && docker-compose -f minio-${MODE}.yaml stop minio6
+
+# Pause one node, to check that all S3 calls work while one node goes wrong
+[ "${MODE}" == "resiliency" ] && docker-compose -f minio-${MODE}.yaml pause minio4
+
+docker run --rm --net=mint_default \
+	--name="mint-${MODE}-${JOB_NAME}" \
+	-e SERVER_ENDPOINT="nginx:9000" \
+	-e ACCESS_KEY="${ACCESS_KEY}" \
+	-e SECRET_KEY="${SECRET_KEY}" \
+	-e ENABLE_HTTPS=0 \
+	-e MINT_NO_FULL_OBJECT="${MINT_NO_FULL_OBJECT}" \
+	-e MINT_MODE="${MINT_MODE}" \
+	docker.io/minio/mint:edge
+
+# FIXME: enable this after fixing aws-sdk-java-v2 tests
+# # unpause the node, to check that all S3 calls work while one node goes wrong
+# [ "${MODE}" == "resiliency" ] && docker-compose -f minio-${MODE}.yaml unpause minio4
+# [ "${MODE}" == "resiliency" ] && docker run --rm --net=mint_default \
+# 	--name="mint-${MODE}-${JOB_NAME}" \
+# 	-e SERVER_ENDPOINT="nginx:9000" \
+# 	-e ACCESS_KEY="${ACCESS_KEY}" \
+# 	-e SECRET_KEY="${SECRET_KEY}" \
+# 	-e ENABLE_HTTPS=0 \
+# 	-e MINT_MODE="${MINT_MODE}" \
+# 	docker.io/minio/mint:edge
 
 docker-compose -f minio-${MODE}.yaml down || true
 sleep 10s
 
 docker system prune -f || true
 docker volume prune -f || true
+docker volume rm $(docker volume ls -q -f dangling=true) || true
 
 ## change working directory
 cd ../../../
-

@@ -24,7 +24,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -34,10 +34,12 @@ import (
 	"time"
 
 	"github.com/minio/minio/internal/event"
+	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
+	"github.com/minio/minio/internal/once"
 	"github.com/minio/minio/internal/store"
-	"github.com/minio/pkg/certs"
-	xnet "github.com/minio/pkg/net"
+	"github.com/minio/pkg/v3/certs"
+	xnet "github.com/minio/pkg/v3/net"
 )
 
 // Webhook constants
@@ -91,7 +93,7 @@ func (w WebhookArgs) Validate() error {
 
 // WebhookTarget - Webhook target.
 type WebhookTarget struct {
-	lazyInit lazyInit
+	initOnce once.Init
 
 	id         event.TargetID
 	args       WebhookArgs
@@ -101,6 +103,8 @@ type WebhookTarget struct {
 	loggerOnce logger.LogOnce
 	cancel     context.CancelFunc
 	cancelCh   <-chan struct{}
+
+	addr string // full address ip/dns with a port number, e.g.  x.x.x.x:8080
 }
 
 // ID - returns target ID.
@@ -127,34 +131,14 @@ func (target *WebhookTarget) Store() event.TargetStore {
 }
 
 func (target *WebhookTarget) isActive() (bool, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, target.args.Endpoint.String(), nil)
+	conn, err := net.DialTimeout("tcp", target.addr, 5*time.Second)
 	if err != nil {
 		if xnet.IsNetworkOrHostDown(err, false) {
 			return false, store.ErrNotConnected
 		}
 		return false, err
 	}
-	tokens := strings.Fields(target.args.AuthToken)
-	switch len(tokens) {
-	case 2:
-		req.Header.Set("Authorization", target.args.AuthToken)
-	case 1:
-		req.Header.Set("Authorization", "Bearer "+target.args.AuthToken)
-	}
-
-	resp, err := target.httpClient.Do(req)
-	if err != nil {
-		if xnet.IsNetworkOrHostDown(err, true) {
-			return false, store.ErrNotConnected
-		}
-		return false, err
-	}
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-	// No network failure i.e response from the target means its up
+	defer conn.Close()
 	return true, nil
 }
 
@@ -162,7 +146,8 @@ func (target *WebhookTarget) isActive() (bool, error) {
 // which will be replayed when the webhook connection is active.
 func (target *WebhookTarget) Save(eventData event.Event) error {
 	if target.store != nil {
-		return target.store.Put(eventData)
+		_, err := target.store.Put(eventData)
+		return err
 	}
 	if err := target.init(); err != nil {
 		return err
@@ -212,23 +197,24 @@ func (target *WebhookTarget) send(eventData event.Event) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
+	xhttp.DrainBody(resp.Body)
 
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return fmt.Errorf("sending event failed with %v", resp.Status)
+	if resp.StatusCode >= 200 && resp.StatusCode <= 299 {
+		// accepted HTTP status codes.
+		return nil
+	} else if resp.StatusCode == http.StatusForbidden {
+		return fmt.Errorf("%s returned '%s', please check if your auth token is correctly set", target.args.Endpoint, resp.Status)
 	}
-
-	return nil
+	return fmt.Errorf("%s returned '%s', please check your endpoint configuration", target.args.Endpoint, resp.Status)
 }
 
-// Send - reads an event from store and sends it to webhook.
-func (target *WebhookTarget) Send(eventKey string) error {
+// SendFromStore - reads an event from store and sends it to webhook.
+func (target *WebhookTarget) SendFromStore(key store.Key) error {
 	if err := target.init(); err != nil {
 		return err
 	}
 
-	eventData, eErr := target.store.Get(eventKey)
+	eventData, eErr := target.store.Get(key)
 	if eErr != nil {
 		// The last event key in a successful batch will be sent in the channel atmost once by the replayEvents()
 		// Such events will not exist and would've been already been sent successfully.
@@ -246,7 +232,7 @@ func (target *WebhookTarget) Send(eventKey string) error {
 	}
 
 	// Delete the event from store.
-	return target.store.Del(eventKey)
+	return target.store.Del(key)
 }
 
 // Close - does nothing and available for interface compatibility.
@@ -256,7 +242,7 @@ func (target *WebhookTarget) Close() error {
 }
 
 func (target *WebhookTarget) init() error {
-	return target.lazyInit.Do(target.initWebhook)
+	return target.initOnce.Do(target.initWebhook)
 }
 
 // Only called from init()
@@ -307,6 +293,19 @@ func NewWebhookTarget(ctx context.Context, id string, args WebhookArgs, loggerOn
 		store:      queueStore,
 		cancel:     cancel,
 		cancelCh:   ctx.Done(),
+	}
+
+	// Calculate the webhook addr with the port number format
+	target.addr = args.Endpoint.Host
+	if _, _, err := net.SplitHostPort(args.Endpoint.Host); err != nil && strings.Contains(err.Error(), "missing port in address") {
+		switch strings.ToLower(args.Endpoint.Scheme) {
+		case "http":
+			target.addr += ":80"
+		case "https":
+			target.addr += ":443"
+		default:
+			return nil, errors.New("unsupported scheme")
+		}
 	}
 
 	if target.store != nil {

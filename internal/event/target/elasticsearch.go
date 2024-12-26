@@ -23,7 +23,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -35,9 +34,11 @@ import (
 	elasticsearch7 "github.com/elastic/go-elasticsearch/v7"
 	"github.com/minio/highwayhash"
 	"github.com/minio/minio/internal/event"
+	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
+	"github.com/minio/minio/internal/once"
 	"github.com/minio/minio/internal/store"
-	xnet "github.com/minio/pkg/net"
+	xnet "github.com/minio/pkg/v3/net"
 	"github.com/pkg/errors"
 )
 
@@ -70,7 +71,7 @@ const (
 	ESSUnknown ESSupportStatus = "ESSUnknown"
 	// ESSDeprecated -> support will be removed in future
 	ESSDeprecated ESSupportStatus = "ESSDeprecated"
-	// ESSUnsupported -> we wont work with this ES server
+	// ESSUnsupported -> we won't work with this ES server
 	ESSUnsupported ESSupportStatus = "ESSUnsupported"
 	// ESSSupported -> all good!
 	ESSSupported ESSupportStatus = "ESSSupported"
@@ -153,7 +154,7 @@ func (a ElasticsearchArgs) Validate() error {
 
 // ElasticsearchTarget - Elasticsearch target.
 type ElasticsearchTarget struct {
-	lazyInit lazyInit
+	initOnce once.Init
 
 	id         event.TargetID
 	args       ElasticsearchArgs
@@ -201,7 +202,8 @@ func (target *ElasticsearchTarget) isActive() (bool, error) {
 // Save - saves the events to the store if queuestore is configured, which will be replayed when the elasticsearch connection is active.
 func (target *ElasticsearchTarget) Save(eventData event.Event) error {
 	if target.store != nil {
-		return target.store.Put(eventData)
+		_, err := target.store.Put(eventData)
+		return err
 	}
 	if err := target.init(); err != nil {
 		return err
@@ -263,8 +265,8 @@ func (target *ElasticsearchTarget) send(eventData event.Event) error {
 	return nil
 }
 
-// Send - reads an event from store and sends it to Elasticsearch.
-func (target *ElasticsearchTarget) Send(eventKey string) error {
+// SendFromStore - reads an event from store and sends it to Elasticsearch.
+func (target *ElasticsearchTarget) SendFromStore(key store.Key) error {
 	if err := target.init(); err != nil {
 		return err
 	}
@@ -277,7 +279,7 @@ func (target *ElasticsearchTarget) Send(eventKey string) error {
 		return err
 	}
 
-	eventData, eErr := target.store.Get(eventKey)
+	eventData, eErr := target.store.Get(key)
 	if eErr != nil {
 		// The last event key in a successful batch will be sent in the channel atmost once by the replayEvents()
 		// Such events will not exist and wouldve been already been sent successfully.
@@ -295,7 +297,7 @@ func (target *ElasticsearchTarget) Send(eventKey string) error {
 	}
 
 	// Delete the event from store.
-	return target.store.Del(eventKey)
+	return target.store.Del(key)
 }
 
 // Close - does nothing and available for interface compatibility.
@@ -344,7 +346,7 @@ func (target *ElasticsearchTarget) checkAndInitClient(ctx context.Context) error
 }
 
 func (target *ElasticsearchTarget) init() error {
-	return target.lazyInit.Do(target.initElasticsearch)
+	return target.initOnce.Do(target.initElasticsearch)
 }
 
 func (target *ElasticsearchTarget) initElasticsearch() error {
@@ -474,12 +476,10 @@ func (c *esClientV7) createIndex(args ElasticsearchArgs) error {
 		if err != nil {
 			return err
 		}
-		defer resp.Body.Close()
+		defer xhttp.DrainBody(resp.Body)
 		if resp.IsError() {
-			err := fmt.Errorf("Create index err: %s", res.String())
-			return err
+			return fmt.Errorf("Create index err: %v", res)
 		}
-		io.Copy(io.Discard, resp.Body)
 		return nil
 	}
 	return nil
@@ -492,8 +492,7 @@ func (c *esClientV7) ping(ctx context.Context, _ ElasticsearchArgs) (bool, error
 	if err != nil {
 		return false, store.ErrNotConnected
 	}
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
+	xhttp.DrainBody(resp.Body)
 	return !resp.IsError(), nil
 }
 
@@ -506,8 +505,7 @@ func (c *esClientV7) entryExists(ctx context.Context, index string, key string) 
 	if err != nil {
 		return false, err
 	}
-	io.Copy(io.Discard, res.Body)
-	res.Body.Close()
+	xhttp.DrainBody(res.Body)
 	return !res.IsError(), nil
 }
 
@@ -522,8 +520,7 @@ func (c *esClientV7) removeEntry(ctx context.Context, index string, key string) 
 		if err != nil {
 			return err
 		}
-		defer res.Body.Close()
-		defer io.Copy(io.Discard, res.Body)
+		defer xhttp.DrainBody(res.Body)
 		if res.IsError() {
 			return fmt.Errorf("Delete err: %s", res.String())
 		}
@@ -551,8 +548,7 @@ func (c *esClientV7) updateEntry(ctx context.Context, index string, key string, 
 	if err != nil {
 		return err
 	}
-	defer res.Body.Close()
-	defer io.Copy(io.Discard, res.Body)
+	defer xhttp.DrainBody(res.Body)
 	if res.IsError() {
 		return fmt.Errorf("Update err: %s", res.String())
 	}
@@ -578,8 +574,7 @@ func (c *esClientV7) addEntry(ctx context.Context, index string, eventData event
 	if err != nil {
 		return err
 	}
-	defer res.Body.Close()
-	defer io.Copy(io.Discard, res.Body)
+	defer xhttp.DrainBody(res.Body)
 	if res.IsError() {
 		return fmt.Errorf("Add err: %s", res.String())
 	}

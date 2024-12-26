@@ -25,7 +25,7 @@ import (
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/mux"
-	"github.com/minio/pkg/bucket/policy"
+	"github.com/minio/pkg/v3/policy"
 )
 
 // Data types used for returning dummy access control
@@ -91,7 +91,7 @@ func (api objectAPIHandlers) PutBucketACLHandler(w http.ResponseWriter, r *http.
 		acl := &accessControlPolicy{}
 		if err = xmlDecoder(r.Body, acl, r.ContentLength); err != nil {
 			if terr, ok := err.(*xml.SyntaxError); ok && terr.Msg == io.EOF.Error() {
-				writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrMissingSecurityHeader),
+				writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrMalformedXML),
 					r.URL)
 				return
 			}

@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
+// Copyright (c) 2015-2024 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -24,7 +24,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -32,7 +31,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/minio/madmin-go/v2"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio-go/v7/pkg/tags"
 	"github.com/minio/minio/internal/amztime"
 	sse "github.com/minio/minio/internal/bucket/encryption"
@@ -41,8 +40,8 @@ import (
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/s3select"
-	"github.com/minio/pkg/env"
-	"github.com/minio/pkg/workers"
+	xnet "github.com/minio/pkg/v3/net"
+	"github.com/zeebo/xxh3"
 )
 
 const (
@@ -63,7 +62,8 @@ type LifecycleSys struct{}
 
 // Get - gets lifecycle config associated to a given bucket name.
 func (sys *LifecycleSys) Get(bucketName string) (lc *lifecycle.Lifecycle, err error) {
-	return globalBucketMetadataSys.GetLifecycleConfig(bucketName)
+	lc, _, err = globalBucketMetadataSys.GetLifecycleConfig(bucketName)
+	return lc, err
 }
 
 // NewLifecycleSys - creates new lifecycle system.
@@ -71,7 +71,8 @@ func NewLifecycleSys() *LifecycleSys {
 	return &LifecycleSys{}
 }
 
-func ilmTrace(startTime time.Time, duration time.Duration, oi ObjectInfo, event string) madmin.TraceInfo {
+func ilmTrace(startTime time.Time, duration time.Duration, oi ObjectInfo, event string, metadata map[string]string, err string) madmin.TraceInfo {
+	sz, _ := oi.GetActualSize()
 	return madmin.TraceInfo{
 		TraceType: madmin.TraceILM,
 		Time:      startTime,
@@ -79,18 +80,23 @@ func ilmTrace(startTime time.Time, duration time.Duration, oi ObjectInfo, event 
 		FuncName:  event,
 		Duration:  duration,
 		Path:      pathJoin(oi.Bucket, oi.Name),
-		Error:     "",
+		Bytes:     sz,
+		Error:     err,
 		Message:   getSource(4),
-		Custom:    map[string]string{"version-id": oi.VersionID},
+		Custom:    metadata,
 	}
 }
 
-func (sys *LifecycleSys) trace(oi ObjectInfo) func(event string) {
+func (sys *LifecycleSys) trace(oi ObjectInfo) func(event string, metadata map[string]string, err error) {
 	startTime := time.Now()
-	return func(event string) {
+	return func(event string, metadata map[string]string, err error) {
 		duration := time.Since(startTime)
 		if globalTrace.NumSubscribers(madmin.TraceILM) > 0 {
-			globalTrace.Publish(ilmTrace(startTime, duration, oi, event))
+			e := ""
+			if err != nil {
+				e = err.Error()
+			}
+			globalTrace.Publish(ilmTrace(startTime, duration, oi, event, metadata, e))
 		}
 	}
 }
@@ -98,96 +104,292 @@ func (sys *LifecycleSys) trace(oi ObjectInfo) func(event string) {
 type expiryTask struct {
 	objInfo ObjectInfo
 	event   lifecycle.Event
+	src     lcEventSrc
 }
 
+// expiryStats records metrics related to ILM expiry activities
+type expiryStats struct {
+	missedExpiryTasks      atomic.Int64
+	missedFreeVersTasks    atomic.Int64
+	missedTierJournalTasks atomic.Int64
+	workers                atomic.Int32
+}
+
+// MissedTasks returns the number of ILM expiry tasks that were missed since
+// there were no available workers.
+func (e *expiryStats) MissedTasks() int64 {
+	return e.missedExpiryTasks.Load()
+}
+
+// MissedFreeVersTasks returns the number of free version collection tasks that
+// were missed since there were no available workers.
+func (e *expiryStats) MissedFreeVersTasks() int64 {
+	return e.missedFreeVersTasks.Load()
+}
+
+// MissedTierJournalTasks returns the number of tasks to remove tiered objects
+// that were missed since there were no available workers.
+func (e *expiryStats) MissedTierJournalTasks() int64 {
+	return e.missedTierJournalTasks.Load()
+}
+
+// NumWorkers returns the number of active workers executing one of ILM expiry
+// tasks or free version collection tasks.
+func (e *expiryStats) NumWorkers() int32 {
+	return e.workers.Load()
+}
+
+type expiryOp interface {
+	OpHash() uint64
+}
+
+type freeVersionTask struct {
+	ObjectInfo
+}
+
+func (f freeVersionTask) OpHash() uint64 {
+	return xxh3.HashString(f.TransitionedObject.Tier + f.TransitionedObject.Name)
+}
+
+func (n newerNoncurrentTask) OpHash() uint64 {
+	return xxh3.HashString(n.bucket + n.versions[0].ObjectV.ObjectName)
+}
+
+func (j jentry) OpHash() uint64 {
+	return xxh3.HashString(j.TierName + j.ObjName)
+}
+
+func (e expiryTask) OpHash() uint64 {
+	return xxh3.HashString(e.objInfo.Bucket + e.objInfo.Name)
+}
+
+// expiryState manages all ILM related expiration activities.
 type expiryState struct {
-	once                sync.Once
-	byDaysCh            chan expiryTask
-	byNewerNoncurrentCh chan newerNoncurrentTask
+	mu      sync.RWMutex
+	workers atomic.Pointer[[]chan expiryOp]
+
+	ctx    context.Context
+	objAPI ObjectLayer
+
+	stats expiryStats
 }
 
 // PendingTasks returns the number of pending ILM expiry tasks.
 func (es *expiryState) PendingTasks() int {
-	return len(es.byDaysCh) + len(es.byNewerNoncurrentCh)
+	w := es.workers.Load()
+	if w == nil || len(*w) == 0 {
+		return 0
+	}
+	var tasks int
+	for _, wrkr := range *w {
+		tasks += len(wrkr)
+	}
+	return tasks
 }
 
-// close closes work channels exactly once.
-func (es *expiryState) close() {
-	es.once.Do(func() {
-		close(es.byDaysCh)
-		close(es.byNewerNoncurrentCh)
-	})
+// enqueueTierJournalEntry enqueues a tier journal entry referring to a remote
+// object corresponding to a 'replaced' object versions. This applies only to
+// non-versioned or version suspended buckets.
+func (es *expiryState) enqueueTierJournalEntry(je jentry) {
+	wrkr := es.getWorkerCh(je.OpHash())
+	if wrkr == nil {
+		es.stats.missedTierJournalTasks.Add(1)
+		return
+	}
+	select {
+	case <-GlobalContext.Done():
+	case wrkr <- je:
+	default:
+		es.stats.missedTierJournalTasks.Add(1)
+	}
+}
+
+// enqueueFreeVersion enqueues a free version to be deleted
+func (es *expiryState) enqueueFreeVersion(oi ObjectInfo) {
+	task := freeVersionTask{ObjectInfo: oi}
+	wrkr := es.getWorkerCh(task.OpHash())
+	if wrkr == nil {
+		es.stats.missedFreeVersTasks.Add(1)
+		return
+	}
+	select {
+	case <-GlobalContext.Done():
+	case wrkr <- task:
+	default:
+		es.stats.missedFreeVersTasks.Add(1)
+	}
 }
 
 // enqueueByDays enqueues object versions expired by days for expiry.
-func (es *expiryState) enqueueByDays(oi ObjectInfo, event lifecycle.Event) {
+func (es *expiryState) enqueueByDays(oi ObjectInfo, event lifecycle.Event, src lcEventSrc) {
+	task := expiryTask{objInfo: oi, event: event, src: src}
+	wrkr := es.getWorkerCh(task.OpHash())
+	if wrkr == nil {
+		es.stats.missedExpiryTasks.Add(1)
+		return
+	}
 	select {
 	case <-GlobalContext.Done():
-		es.close()
-	case es.byDaysCh <- expiryTask{objInfo: oi, event: event}:
+	case wrkr <- task:
 	default:
+		es.stats.missedExpiryTasks.Add(1)
 	}
 }
 
 // enqueueByNewerNoncurrent enqueues object versions expired by
 // NewerNoncurrentVersions limit for expiry.
 func (es *expiryState) enqueueByNewerNoncurrent(bucket string, versions []ObjectToDelete, lcEvent lifecycle.Event) {
+	if len(versions) == 0 {
+		return
+	}
+
+	task := newerNoncurrentTask{bucket: bucket, versions: versions, event: lcEvent}
+	wrkr := es.getWorkerCh(task.OpHash())
+	if wrkr == nil {
+		es.stats.missedExpiryTasks.Add(1)
+		return
+	}
 	select {
 	case <-GlobalContext.Done():
-		es.close()
-	case es.byNewerNoncurrentCh <- newerNoncurrentTask{bucket: bucket, versions: versions, event: lcEvent}:
+	case wrkr <- task:
 	default:
+		es.stats.missedExpiryTasks.Add(1)
 	}
 }
 
+// globalExpiryState is the per-node instance which manages all ILM expiry tasks.
 var globalExpiryState *expiryState
 
-func newExpiryState() *expiryState {
-	return &expiryState{
-		byDaysCh:            make(chan expiryTask, 100000),
-		byNewerNoncurrentCh: make(chan newerNoncurrentTask, 100000),
+// newExpiryState creates an expiryState with buffered channels allocated for
+// each ILM expiry task type.
+func newExpiryState(ctx context.Context, objAPI ObjectLayer, n int) *expiryState {
+	es := &expiryState{
+		ctx:    ctx,
+		objAPI: objAPI,
+	}
+	workers := make([]chan expiryOp, 0, n)
+	es.workers.Store(&workers)
+	es.ResizeWorkers(n)
+	return es
+}
+
+func (es *expiryState) getWorkerCh(h uint64) chan<- expiryOp {
+	w := es.workers.Load()
+	if w == nil || len(*w) == 0 {
+		return nil
+	}
+	workers := *w
+	return workers[h%uint64(len(workers))]
+}
+
+func (es *expiryState) ResizeWorkers(n int) {
+	if n == 0 {
+		n = 100
+	}
+
+	// Lock to avoid multiple resizes to happen at the same time.
+	es.mu.Lock()
+	defer es.mu.Unlock()
+	var workers []chan expiryOp
+	if v := es.workers.Load(); v != nil {
+		// Copy to new array.
+		workers = append(workers, *v...)
+	}
+
+	if n == len(workers) || n < 1 {
+		return
+	}
+
+	for len(workers) < n {
+		input := make(chan expiryOp, 10000)
+		workers = append(workers, input)
+		go es.Worker(input)
+		es.stats.workers.Add(1)
+	}
+
+	for len(workers) > n {
+		worker := workers[len(workers)-1]
+		workers = workers[:len(workers)-1]
+		worker <- expiryOp(nil)
+		es.stats.workers.Add(-1)
+	}
+	// Atomically replace workers.
+	es.workers.Store(&workers)
+}
+
+// Worker handles 4 types of expiration tasks.
+// 1. Expiry of objects, includes regular and transitioned objects
+// 2. Expiry of noncurrent versions due to NewerNoncurrentVersions
+// 3. Expiry of free-versions, for remote objects of transitioned object which have been expired since.
+// 4. Expiry of remote objects corresponding to objects in a
+// non-versioned/version suspended buckets
+func (es *expiryState) Worker(input <-chan expiryOp) {
+	for {
+		select {
+		case <-es.ctx.Done():
+			return
+		case v, ok := <-input:
+			if !ok {
+				return
+			}
+			if v == nil {
+				// ResizeWorkers signaling worker to quit
+				return
+			}
+			switch v := v.(type) {
+			case expiryTask:
+				if v.objInfo.TransitionedObject.Status != "" {
+					applyExpiryOnTransitionedObject(es.ctx, es.objAPI, v.objInfo, v.event, v.src)
+				} else {
+					applyExpiryOnNonTransitionedObjects(es.ctx, es.objAPI, v.objInfo, v.event, v.src)
+				}
+			case newerNoncurrentTask:
+				deleteObjectVersions(es.ctx, es.objAPI, v.bucket, v.versions, v.event)
+			case jentry:
+				transitionLogIf(es.ctx, deleteObjectFromRemoteTier(es.ctx, v.ObjName, v.VersionID, v.TierName))
+			case freeVersionTask:
+				oi := v.ObjectInfo
+				traceFn := globalLifecycleSys.trace(oi)
+				if !oi.TransitionedObject.FreeVersion {
+					// nothing to be done
+					continue
+				}
+
+				ignoreNotFoundErr := func(err error) error {
+					switch {
+					case isErrVersionNotFound(err), isErrObjectNotFound(err):
+						return nil
+					}
+					return err
+				}
+				// Remove the remote object
+				err := deleteObjectFromRemoteTier(es.ctx, oi.TransitionedObject.Name, oi.TransitionedObject.VersionID, oi.TransitionedObject.Tier)
+				if ignoreNotFoundErr(err) != nil {
+					transitionLogIf(es.ctx, err)
+					traceFn(ILMFreeVersionDelete, nil, err)
+					continue
+				}
+
+				// Remove this free version
+				_, err = es.objAPI.DeleteObject(es.ctx, oi.Bucket, oi.Name, ObjectOptions{
+					VersionID:        oi.VersionID,
+					InclFreeVersions: true,
+				})
+				if err == nil {
+					auditLogLifecycle(es.ctx, oi, ILMFreeVersionDelete, nil, traceFn)
+				}
+				if ignoreNotFoundErr(err) != nil {
+					transitionLogIf(es.ctx, err)
+				}
+			default:
+				bugLogIf(es.ctx, fmt.Errorf("Invalid work type - %v", v))
+			}
+		}
 	}
 }
 
 func initBackgroundExpiry(ctx context.Context, objectAPI ObjectLayer) {
-	globalExpiryState = newExpiryState()
-
-	workerSize, _ := strconv.Atoi(env.Get("_MINIO_ILM_EXPIRY_WORKERS", strconv.Itoa((runtime.GOMAXPROCS(0)+1)/2)))
-
-	ewk, err := workers.New(workerSize)
-	if err != nil {
-		logger.LogIf(ctx, err)
-	}
-
-	nwk, err := workers.New(workerSize)
-	if err != nil {
-		logger.LogIf(ctx, err)
-	}
-
-	go func() {
-		for t := range globalExpiryState.byDaysCh {
-			ewk.Take()
-			go func(t expiryTask) {
-				defer ewk.Give()
-				if t.objInfo.TransitionedObject.Status != "" {
-					applyExpiryOnTransitionedObject(ctx, objectAPI, t.objInfo, t.event)
-				} else {
-					applyExpiryOnNonTransitionedObjects(ctx, objectAPI, t.objInfo, t.event)
-				}
-			}(t)
-		}
-		ewk.Wait()
-	}()
-	go func() {
-		for t := range globalExpiryState.byNewerNoncurrentCh {
-			nwk.Take()
-			go func(t newerNoncurrentTask) {
-				defer nwk.Give()
-				deleteObjectVersions(ctx, objectAPI, t.bucket, t.versions, t.event)
-			}(t)
-		}
-		nwk.Wait()
-	}()
+	globalExpiryState = newExpiryState(ctx, objectAPI, globalILMConfig.getExpirationWorkers())
 }
 
 // newerNoncurrentTask encapsulates arguments required by worker to expire objects
@@ -200,6 +402,7 @@ type newerNoncurrentTask struct {
 
 type transitionTask struct {
 	objInfo ObjectInfo
+	src     lcEventSrc
 	event   lifecycle.Event
 }
 
@@ -212,17 +415,24 @@ type transitionState struct {
 	numWorkers int
 	killCh     chan struct{}
 
-	activeTasks int32
+	activeTasks          atomic.Int64
+	missedImmediateTasks atomic.Int64
 
 	lastDayMu    sync.RWMutex
 	lastDayStats map[string]*lastDayTierStats
 }
 
-func (t *transitionState) queueTransitionTask(oi ObjectInfo, event lifecycle.Event) {
+func (t *transitionState) queueTransitionTask(oi ObjectInfo, event lifecycle.Event, src lcEventSrc) {
+	task := transitionTask{objInfo: oi, event: event, src: src}
 	select {
 	case <-t.ctx.Done():
-	case t.transitionCh <- transitionTask{objInfo: oi, event: event}:
+	case t.transitionCh <- task:
 	default:
+		switch src {
+		case lcEventSrc_s3PutObject, lcEventSrc_s3CopyObject, lcEventSrc_s3CompleteMultipartUpload:
+			// Update missed immediate tasks only for incoming requests.
+			t.missedImmediateTasks.Add(1)
+		}
 	}
 }
 
@@ -232,7 +442,7 @@ var globalTransitionState *transitionState
 // via its Init method.
 func newTransitionState(ctx context.Context) *transitionState {
 	return &transitionState{
-		transitionCh: make(chan transitionTask, 10000),
+		transitionCh: make(chan transitionTask, 100000),
 		ctx:          ctx,
 		killCh:       make(chan struct{}),
 		lastDayStats: make(map[string]*lastDayTierStats),
@@ -243,6 +453,10 @@ func newTransitionState(ctx context.Context) *transitionState {
 // of transition workers.
 func (t *transitionState) Init(objAPI ObjectLayer) {
 	n := globalAPIConfig.getTransitionWorkers()
+	// Prefer ilm.transition_workers over now deprecated api.transition_workers
+	if tw := globalILMConfig.getTransitionWorkers(); tw > 0 {
+		n = tw
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -257,8 +471,14 @@ func (t *transitionState) PendingTasks() int {
 }
 
 // ActiveTasks returns the number of active (ongoing) ILM transition tasks.
-func (t *transitionState) ActiveTasks() int {
-	return int(atomic.LoadInt32(&t.activeTasks))
+func (t *transitionState) ActiveTasks() int64 {
+	return t.activeTasks.Load()
+}
+
+// MissedImmediateTasks returns the number of tasks - deferred to scanner due
+// to tasks channel being backlogged.
+func (t *transitionState) MissedImmediateTasks() int64 {
+	return t.missedImmediateTasks.Load()
 }
 
 // worker waits for transition tasks
@@ -273,10 +493,14 @@ func (t *transitionState) worker(objectAPI ObjectLayer) {
 			if !ok {
 				return
 			}
-			atomic.AddInt32(&t.activeTasks, 1)
-			if err := transitionObject(t.ctx, objectAPI, task.objInfo, task.event); err != nil {
-				logger.LogIf(t.ctx, fmt.Errorf("Transition to %s failed for %s/%s version:%s with %w",
-					task.event.StorageClass, task.objInfo.Bucket, task.objInfo.Name, task.objInfo.VersionID, err))
+			t.activeTasks.Add(1)
+			if err := transitionObject(t.ctx, objectAPI, task.objInfo, newLifecycleAuditEvent(task.src, task.event)); err != nil {
+				if !isErrVersionNotFound(err) && !isErrObjectNotFound(err) && !xnet.IsNetworkOrHostDown(err, false) {
+					if !strings.Contains(err.Error(), "use of closed network connection") {
+						transitionLogIf(t.ctx, fmt.Errorf("Transition to %s failed for %s/%s version:%s with %w",
+							task.event.StorageClass, task.objInfo.Bucket, task.objInfo.Name, task.objInfo.VersionID, err))
+					}
+				}
 			} else {
 				ts := tierStats{
 					TotalSize:   uint64(task.objInfo.Size),
@@ -287,7 +511,7 @@ func (t *transitionState) worker(objectAPI ObjectLayer) {
 				}
 				t.addLastDayStats(task.event.StorageClass, ts)
 			}
-			atomic.AddInt32(&t.activeTasks, -1)
+			t.activeTasks.Add(-1)
 		}
 	}
 }
@@ -325,6 +549,10 @@ func (t *transitionState) UpdateWorkers(n int) {
 }
 
 func (t *transitionState) updateWorkers(n int) {
+	if n == 0 {
+		n = 100
+	}
+
 	for t.numWorkers < n {
 		go t.worker(t.objAPI)
 		t.numWorkers++
@@ -356,11 +584,15 @@ func validateTransitionTier(lc *lifecycle.Lifecycle) error {
 
 // enqueueTransitionImmediate enqueues obj for transition if eligible.
 // This is to be called after a successful upload of an object (version).
-func enqueueTransitionImmediate(obj ObjectInfo) {
+func enqueueTransitionImmediate(obj ObjectInfo, src lcEventSrc) {
 	if lc, err := globalLifecycleSys.Get(obj.Bucket); err == nil {
 		switch event := lc.Eval(obj.ToLifecycleOpts()); event.Action {
 		case lifecycle.TransitionAction, lifecycle.TransitionVersionAction:
-			globalTransitionState.queueTransitionTask(obj, event)
+			if obj.DeleteMarker || obj.IsDir {
+				// nothing to transition
+				return
+			}
+			globalTransitionState.queueTransitionTask(obj, event, src)
 		}
 	}
 }
@@ -370,13 +602,16 @@ func enqueueTransitionImmediate(obj ObjectInfo) {
 //
 // 1. when a restored (via PostRestoreObject API) object expires.
 // 2. when a transitioned object expires (based on an ILM rule).
-func expireTransitionedObject(ctx context.Context, objectAPI ObjectLayer, oi *ObjectInfo, lcOpts lifecycle.ObjectOpts, lcEvent lifecycle.Event) error {
+func expireTransitionedObject(ctx context.Context, objectAPI ObjectLayer, oi *ObjectInfo, lcEvent lifecycle.Event, src lcEventSrc) error {
 	traceFn := globalLifecycleSys.trace(*oi)
-	var opts ObjectOptions
-	opts.Versioned = globalBucketVersioningSys.PrefixEnabled(oi.Bucket, oi.Name)
-	opts.VersionID = lcOpts.VersionID
-	opts.Expiration = ExpirationOptions{Expire: true}
-	tags := auditLifecycleTags(lcEvent)
+	opts := ObjectOptions{
+		Versioned:  globalBucketVersioningSys.PrefixEnabled(oi.Bucket, oi.Name),
+		Expiration: ExpirationOptions{Expire: true},
+	}
+	if lcEvent.Action.DeleteVersioned() {
+		opts.VersionID = oi.VersionID
+	}
+	tags := newLifecycleAuditEvent(src, lcEvent).Tags()
 	if lcEvent.Action.DeleteRestored() {
 		// delete locally restored copy of object or object version
 		// from the source, while leaving metadata behind. The data on
@@ -390,21 +625,19 @@ func expireTransitionedObject(ctx context.Context, objectAPI ObjectLayer, oi *Ob
 		}
 		return err
 	}
-	// When an object is past expiry or when a transitioned object is being
-	// deleted, 'mark' the data in the remote tier for delete.
-	entry := jentry{
-		ObjName:   oi.TransitionedObject.Name,
-		VersionID: oi.TransitionedObject.VersionID,
-		TierName:  oi.TransitionedObject.Tier,
+
+	// Delete remote object from warm-tier
+	err := deleteObjectFromRemoteTier(ctx, oi.TransitionedObject.Name, oi.TransitionedObject.VersionID, oi.TransitionedObject.Tier)
+	if err == nil {
+		// Skip adding free version since we successfully deleted the
+		// remote object
+		opts.SkipFreeVersion = true
+	} else {
+		transitionLogIf(ctx, err)
 	}
-	if err := globalTierJournal.AddEntry(entry); err != nil {
-		logger.LogIf(ctx, err)
-		return err
-	}
-	// Delete metadata on source, now that data in remote tier has been
-	// marked for deletion.
+
+	// Now, delete object from hot-tier namespace
 	if _, err := objectAPI.DeleteObject(ctx, oi.Bucket, oi.Name, opts); err != nil {
-		logger.LogIf(ctx, err)
 		return err
 	}
 
@@ -412,13 +645,13 @@ func expireTransitionedObject(ctx context.Context, objectAPI ObjectLayer, oi *Ob
 	defer auditLogLifecycle(ctx, *oi, ILMExpiry, tags, traceFn)
 
 	eventName := event.ObjectRemovedDelete
-	if lcOpts.DeleteMarker {
+	if oi.DeleteMarker {
 		eventName = event.ObjectRemovedDeleteMarkerCreated
 	}
 	objInfo := ObjectInfo{
 		Name:         oi.Name,
-		VersionID:    lcOpts.VersionID,
-		DeleteMarker: lcOpts.DeleteMarker,
+		VersionID:    oi.VersionID,
+		DeleteMarker: oi.DeleteMarker,
 	}
 	// Notify object deleted event.
 	sendEvent(eventArgs{
@@ -439,7 +672,8 @@ func genTransitionObjName(bucket string) (string, error) {
 		return "", err
 	}
 	us := u.String()
-	obj := fmt.Sprintf("%s/%s/%s/%s/%s", globalDeploymentID, bucket, us[0:2], us[2:4], us)
+	hash := xxh3.HashString(pathJoin(globalDeploymentID(), bucket))
+	obj := fmt.Sprintf("%s/%s/%s/%s", strconv.FormatUint(hash, 16), us[0:2], us[2:4], us)
 	return obj, nil
 }
 
@@ -447,18 +681,26 @@ func genTransitionObjName(bucket string) (string, error) {
 // storage specified by the transition ARN, the metadata is left behind on source cluster and original content
 // is moved to the transition tier. Note that in the case of encrypted objects, entire encrypted stream is moved
 // to the transition tier without decrypting or re-encrypting.
-func transitionObject(ctx context.Context, objectAPI ObjectLayer, oi ObjectInfo, lcEvent lifecycle.Event) error {
+func transitionObject(ctx context.Context, objectAPI ObjectLayer, oi ObjectInfo, lae lcAuditEvent) (err error) {
+	timeILM := globalScannerMetrics.timeILM(lae.Action)
+	defer func() {
+		if err != nil {
+			return
+		}
+		timeILM(1)
+	}()
+
 	opts := ObjectOptions{
 		Transition: TransitionOptions{
 			Status: lifecycle.TransitionPending,
-			Tier:   lcEvent.StorageClass,
+			Tier:   lae.StorageClass,
 			ETag:   oi.ETag,
 		},
-		LifecycleEvent:   lcEvent,
-		VersionID:        oi.VersionID,
-		Versioned:        globalBucketVersioningSys.PrefixEnabled(oi.Bucket, oi.Name),
-		VersionSuspended: globalBucketVersioningSys.PrefixSuspended(oi.Bucket, oi.Name),
-		MTime:            oi.ModTime,
+		LifecycleAuditEvent: lae,
+		VersionID:           oi.VersionID,
+		Versioned:           globalBucketVersioningSys.PrefixEnabled(oi.Bucket, oi.Name),
+		VersionSuspended:    globalBucketVersioningSys.PrefixSuspended(oi.Bucket, oi.Name),
+		MTime:               oi.ModTime,
 	}
 	return objectAPI.TransitionObject(ctx, oi.Bucket, oi.Name, opts)
 }
@@ -468,6 +710,11 @@ type auditTierOp struct {
 	TimeToResponseNS int64  `json:"timeToResponseNS"`
 	OutputBytes      int64  `json:"tx,omitempty"`
 	Error            string `json:"error,omitempty"`
+}
+
+func (op auditTierOp) String() string {
+	// flattening the auditTierOp{} for audit
+	return fmt.Sprintf("tier:%s,respNS:%d,tx:%d,err:%s", op.Tier, op.TimeToResponseNS, op.OutputBytes, op.Error)
 }
 
 func auditTierActions(ctx context.Context, tier string, bytes int64) func(err error) {
@@ -484,23 +731,27 @@ func auditTierActions(ctx context.Context, tier string, bytes int64) func(err er
 		}
 
 		if err == nil {
-			op.TimeToResponseNS = time.Since(startTime).Nanoseconds()
+			since := time.Since(startTime)
+			op.TimeToResponseNS = since.Nanoseconds()
+			globalTierMetrics.Observe(tier, since)
+			globalTierMetrics.logSuccess(tier)
 		} else {
 			op.Error = err.Error()
+			globalTierMetrics.logFailure(tier)
 		}
 
-		logger.GetReqInfo(ctx).AppendTags("tierStats", op)
+		logger.GetReqInfo(ctx).AppendTags("tierStats", op.String())
 	}
 }
 
 // getTransitionedObjectReader returns a reader from the transitioned tier.
 func getTransitionedObjectReader(ctx context.Context, bucket, object string, rs *HTTPRangeSpec, h http.Header, oi ObjectInfo, opts ObjectOptions) (gr *GetObjectReader, err error) {
-	tgtClient, err := globalTierConfigMgr.getDriver(oi.TransitionedObject.Tier)
+	tgtClient, err := globalTierConfigMgr.getDriver(ctx, oi.TransitionedObject.Tier)
 	if err != nil {
-		return nil, fmt.Errorf("transition storage class not configured")
+		return nil, fmt.Errorf("transition storage class not configured: %w", err)
 	}
 
-	fn, off, length, err := NewGetObjectReader(rs, oi, opts)
+	fn, off, length, err := NewGetObjectReader(rs, oi, opts, h)
 	if err != nil {
 		return nil, ErrorRespToObjectError(err, bucket, object)
 	}
@@ -653,7 +904,7 @@ func postRestoreOpts(ctx context.Context, r *http.Request, bucket, object string
 	if vid != "" && vid != nullVersionID {
 		_, err := uuid.Parse(vid)
 		if err != nil {
-			logger.LogIf(ctx, err)
+			s3LogIf(ctx, err)
 			return opts, InvalidVersionID{
 				Bucket:    bucket,
 				Object:    object,
@@ -686,7 +937,7 @@ func putRestoreOpts(bucket, object string, rreq *RestoreObjectRequest, objInfo O
 
 	if rreq.Type == SelectRestoreRequest {
 		for _, v := range rreq.OutputLocation.S3.UserMetadata {
-			if !strings.HasPrefix(strings.ToLower(v.Name), "x-amz-meta") {
+			if !stringsHasPrefixFold(v.Name, "x-amz-meta") {
 				meta["x-amz-meta-"+v.Name] = v.Value
 				continue
 			}
@@ -757,7 +1008,7 @@ func ongoingRestoreObj() restoreObjStatus {
 	}
 }
 
-// completeRestoreObj constructs restoreObjStatus for a completed restore-object with given expiry.
+// completedRestoreObj constructs restoreObjStatus for a completed restore-object with given expiry.
 func completedRestoreObj(expiry time.Time) restoreObjStatus {
 	return restoreObjStatus{
 		ongoing: false,
@@ -857,6 +1108,7 @@ func (oi ObjectInfo) ToLifecycleOpts() lifecycle.ObjectOpts {
 		UserTags:         oi.UserTags,
 		VersionID:        oi.VersionID,
 		ModTime:          oi.ModTime,
+		Size:             oi.Size,
 		IsLatest:         oi.IsLatest,
 		NumVersions:      oi.NumVersions,
 		DeleteMarker:     oi.DeleteMarker,
@@ -865,36 +1117,4 @@ func (oi ObjectInfo) ToLifecycleOpts() lifecycle.ObjectOpts {
 		RestoreExpires:   oi.RestoreExpires,
 		TransitionStatus: oi.TransitionedObject.Status,
 	}
-}
-
-func auditLifecycleTags(event lifecycle.Event) map[string]interface{} {
-	const (
-		ilmAction                  = "ilm-action"
-		ilmDue                     = "ilm-due"
-		ilmRuleID                  = "ilm-rule-id"
-		ilmTier                    = "ilm-tier"
-		ilmNewerNoncurrentVersions = "ilm-newer-noncurrent-versions"
-		ilmNoncurrentDays          = "ilm-noncurrent-days"
-	)
-	tags := make(map[string]interface{}, 4)
-	tags[ilmAction] = event.Action.String()
-	tags[ilmRuleID] = event.RuleID
-
-	if !event.Due.IsZero() {
-		tags[ilmDue] = event.Due
-	}
-
-	// rule with Transition/NoncurrentVersionTransition in effect
-	if event.StorageClass != "" {
-		tags[ilmTier] = event.StorageClass
-	}
-
-	// rule with NewernoncurrentVersions in effect
-	if event.NewerNoncurrentVersions > 0 {
-		tags[ilmNewerNoncurrentVersions] = event.NewerNoncurrentVersions
-	}
-	if event.NoncurrentDays > 0 {
-		tags[ilmNoncurrentDays] = event.NoncurrentDays
-	}
-	return tags
 }

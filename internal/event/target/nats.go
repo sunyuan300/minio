@@ -31,8 +31,9 @@ import (
 	"github.com/google/uuid"
 	"github.com/minio/minio/internal/event"
 	"github.com/minio/minio/internal/logger"
+	"github.com/minio/minio/internal/once"
 	"github.com/minio/minio/internal/store"
-	xnet "github.com/minio/pkg/net"
+	xnet "github.com/minio/pkg/v3/net"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/stan.go"
 )
@@ -66,6 +67,7 @@ const (
 	EnvNATSAddress       = "MINIO_NOTIFY_NATS_ADDRESS"
 	EnvNATSSubject       = "MINIO_NOTIFY_NATS_SUBJECT"
 	EnvNATSUsername      = "MINIO_NOTIFY_NATS_USERNAME"
+	NATSUserCredentials  = "MINIO_NOTIFY_NATS_USER_CREDENTIALS"
 	EnvNATSPassword      = "MINIO_NOTIFY_NATS_PASSWORD"
 	EnvNATSToken         = "MINIO_NOTIFY_NATS_TOKEN"
 	EnvNATSTLS           = "MINIO_NOTIFY_NATS_TLS"
@@ -89,22 +91,23 @@ const (
 
 // NATSArgs - NATS target arguments.
 type NATSArgs struct {
-	Enable        bool      `json:"enable"`
-	Address       xnet.Host `json:"address"`
-	Subject       string    `json:"subject"`
-	Username      string    `json:"username"`
-	Password      string    `json:"password"`
-	Token         string    `json:"token"`
-	TLS           bool      `json:"tls"`
-	TLSSkipVerify bool      `json:"tlsSkipVerify"`
-	Secure        bool      `json:"secure"`
-	CertAuthority string    `json:"certAuthority"`
-	ClientCert    string    `json:"clientCert"`
-	ClientKey     string    `json:"clientKey"`
-	PingInterval  int64     `json:"pingInterval"`
-	QueueDir      string    `json:"queueDir"`
-	QueueLimit    uint64    `json:"queueLimit"`
-	JetStream     struct {
+	Enable          bool      `json:"enable"`
+	Address         xnet.Host `json:"address"`
+	Subject         string    `json:"subject"`
+	Username        string    `json:"username"`
+	UserCredentials string    `json:"userCredentials"`
+	Password        string    `json:"password"`
+	Token           string    `json:"token"`
+	TLS             bool      `json:"tls"`
+	TLSSkipVerify   bool      `json:"tlsSkipVerify"`
+	Secure          bool      `json:"secure"`
+	CertAuthority   string    `json:"certAuthority"`
+	ClientCert      string    `json:"clientCert"`
+	ClientKey       string    `json:"clientKey"`
+	PingInterval    int64     `json:"pingInterval"`
+	QueueDir        string    `json:"queueDir"`
+	QueueLimit      uint64    `json:"queueLimit"`
+	JetStream       struct {
 		Enable bool `json:"enable"`
 	} `json:"jetStream"`
 	Streaming struct {
@@ -166,6 +169,9 @@ func (n NATSArgs) connectNats() (*nats.Conn, error) {
 	if n.Username != "" && n.Password != "" {
 		connOpts = append(connOpts, nats.UserInfo(n.Username, n.Password))
 	}
+	if n.UserCredentials != "" {
+		connOpts = append(connOpts, nats.UserCredentials(n.UserCredentials))
+	}
 	if n.Token != "" {
 		connOpts = append(connOpts, nats.Token(n.Token))
 	}
@@ -210,13 +216,16 @@ func (n NATSArgs) connectStan() (stan.Conn, error) {
 	if n.Streaming.MaxPubAcksInflight > 0 {
 		connOpts = append(connOpts, stan.MaxPubAcksInflight(n.Streaming.MaxPubAcksInflight))
 	}
+	if n.UserCredentials != "" {
+		connOpts = append(connOpts, stan.NatsOptions(nats.UserCredentials(n.UserCredentials)))
+	}
 
 	return stan.Connect(n.Streaming.ClusterID, clientID, connOpts...)
 }
 
 // NATSTarget - NATS target.
 type NATSTarget struct {
-	lazyInit lazyInit
+	initOnce once.Init
 
 	id         event.TargetID
 	args       NATSArgs
@@ -290,7 +299,8 @@ func (target *NATSTarget) isActive() (bool, error) {
 // Save - saves the events to the store which will be replayed when the Nats connection is active.
 func (target *NATSTarget) Save(eventData event.Event) error {
 	if target.store != nil {
-		return target.store.Put(eventData)
+		_, err := target.store.Put(eventData)
+		return err
 	}
 
 	if err := target.init(); err != nil {
@@ -333,8 +343,8 @@ func (target *NATSTarget) send(eventData event.Event) error {
 	return err
 }
 
-// Send - sends event to Nats.
-func (target *NATSTarget) Send(eventKey string) error {
+// SendFromStore - reads an event from store and sends it to Nats.
+func (target *NATSTarget) SendFromStore(key store.Key) error {
 	if err := target.init(); err != nil {
 		return err
 	}
@@ -344,7 +354,7 @@ func (target *NATSTarget) Send(eventKey string) error {
 		return err
 	}
 
-	eventData, eErr := target.store.Get(eventKey)
+	eventData, eErr := target.store.Get(key)
 	if eErr != nil {
 		// The last event key in a successful batch will be sent in the channel atmost once by the replayEvents()
 		// Such events will not exist and wouldve been already been sent successfully.
@@ -358,7 +368,7 @@ func (target *NATSTarget) Send(eventKey string) error {
 		return err
 	}
 
-	return target.store.Del(eventKey)
+	return target.store.Del(key)
 }
 
 // Close - closes underneath connections to NATS server.
@@ -380,7 +390,7 @@ func (target *NATSTarget) Close() (err error) {
 }
 
 func (target *NATSTarget) init() error {
-	return target.lazyInit.Do(target.initNATS)
+	return target.initOnce.Do(target.initNATS)
 }
 
 func (target *NATSTarget) initNATS() error {
